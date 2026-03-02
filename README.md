@@ -14,6 +14,12 @@ BJSI jointly estimates stress orientation, stress shape ratio `R`, friction `mu`
 - `src/utils_stress.py`: focal geometry, traction, and residual helper functions (ILSI).
 - `src/plot_stress_output.py`: plotting and posterior diagnostic helpers used by the example script.
 
+## Core Features
+
+- **Joint Inversion**: Simultaneously solves for stress state ($R$, principal directions) and the true fault plane from ambiguous focal mechanisms.
+- **Clustering Prior**: Incorporates a `clustering_prior_strength` parameter to resolve ambiguous plane selections by learning from unambiguous events in the same dataset. This probabilistic weighting mechanism calculates a certainty-weighted confident orientation tensor ($T_{conf}$) to guide the selection for ambiguous events based on the prevailing geometric trend of high-confidence selections.
+- **Friction Estimation**: Optionally infers the macroscopic friction coefficient (`mu`) simultaneously with the stress state.
+
 ## Example workflow (`Geysers_inversion.py`)
 
 `Geysers_inversion.py` runs a full inversion on the Geysers catalog and produces:

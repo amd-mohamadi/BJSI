@@ -167,6 +167,7 @@ def Bayesian_joint_plane_selection_SMC(
     R_prior_sigma: float = 2.0,
     plane2_prior_probs: Optional[np.ndarray] = None,
     plane_prior_strength: float = 0.0,
+    clustering_prior_strength: float = 0.0,
 ) -> Dict[str, Any]:
     """
     Joint Bayesian inference of stress orientation, shape ratio, and nodal plane selection using SMC.
@@ -448,6 +449,10 @@ def Bayesian_joint_plane_selection_SMC(
     plane_prior_strength = float(plane_prior_strength)
     if plane_prior_strength < 0.0:
         raise ValueError("plane_prior_strength must be >= 0")
+        
+    clustering_prior_strength = float(clustering_prior_strength)
+    if clustering_prior_strength < 0.0:
+        raise ValueError("clustering_prior_strength must be >= 0")
 
     # --------------------------------------------------------
     # Optional iterative preselection (Michael + instability)
@@ -760,6 +765,24 @@ def Bayesian_joint_plane_selection_SMC(
             beta = pt.as_tensor_variable(beta_val)
             eps = 1e-9
             logit_local = beta * inst_delta
+            
+            # Apply Certainty-Weighted Clustering Prior
+            if clustering_prior_strength > 0.0:
+                p_tentative = pm.math.sigmoid(logit_local)
+                certainty = pt.square(2.0 * p_tentative - 1.0)
+                
+                M1 = n1[:, :, None] * n1[:, None, :] 
+                M2 = n2[:, :, None] * n2[:, None, :]
+                
+                sum_certainty = pt.sum(certainty) + 1e-12
+                # T_conf is shape (3, 3) representing the average confident orientation
+                T_conf = pt.sum(certainty[:, None, None] * ((1.0 - p_tentative)[:, None, None] * M1 + p_tentative[:, None, None] * M2), axis=0) / sum_certainty
+                
+                E1 = pt.sum(n1 * pt.dot(T_conf, n1.T).T, axis=-1)
+                E2 = pt.sum(n2 * pt.dot(T_conf, n2.T).T, axis=-1)
+                
+                logit_local = logit_local + float(clustering_prior_strength) * (E2 - E1)
+
             if plane2_prior_probs_arr is not None and plane_prior_strength > 0.0:
                 prior_p2 = pt.as_tensor_variable(plane2_prior_probs_arr)
                 prior_p2 = pt.clip(prior_p2, eps, 1.0 - eps)
@@ -1130,6 +1153,7 @@ def Bayesian_joint_plane_selection_NUTS(
     R_prior_sigma: float = 2.0,
     plane2_prior_probs: Optional[np.ndarray] = None,
     plane_prior_strength: float = 0.0,
+    clustering_prior_strength: float = 0.0,
 ) -> Dict[str, Any]:
     """
     Joint Bayesian inference of stress orientation, shape ratio, and nodal plane selection using NUTS.
@@ -1222,6 +1246,10 @@ def Bayesian_joint_plane_selection_NUTS(
     plane_prior_strength = float(plane_prior_strength)
     if plane_prior_strength < 0.0:
         raise ValueError("plane_prior_strength must be >= 0")
+
+    clustering_prior_strength = float(clustering_prior_strength)
+    if clustering_prior_strength < 0.0:
+        raise ValueError("clustering_prior_strength must be >= 0")
 
     # --------------------------------------------------------
     # Optional iterative preselection (Michael + instability)
@@ -1480,6 +1508,24 @@ def Bayesian_joint_plane_selection_NUTS(
             beta_val = float(instability_beta if selection_beta is None else selection_beta)
             beta = pt.as_tensor_variable(beta_val)
             logit_local = beta * inst_delta
+            
+            # Apply Certainty-Weighted Clustering Prior
+            if clustering_prior_strength > 0.0:
+                p_tentative = pm.math.sigmoid(logit_local)
+                certainty = pt.square(2.0 * p_tentative - 1.0)
+                
+                M1 = n1[:, :, None] * n1[:, None, :] 
+                M2 = n2[:, :, None] * n2[:, None, :]
+                
+                sum_certainty = pt.sum(certainty) + 1e-12
+                # T_conf is shape (3, 3) representing the average confident orientation
+                T_conf = pt.sum(certainty[:, None, None] * ((1.0 - p_tentative)[:, None, None] * M1 + p_tentative[:, None, None] * M2), axis=0) / sum_certainty
+                
+                E1 = pt.sum(n1 * pt.dot(T_conf, n1.T).T, axis=-1)
+                E2 = pt.sum(n2 * pt.dot(T_conf, n2.T).T, axis=-1)
+                
+                logit_local = logit_local + float(clustering_prior_strength) * (E2 - E1)
+
             if plane2_prior_probs_arr is not None and plane_prior_strength > 0.0:
                 prior_p2 = pt.as_tensor_variable(plane2_prior_probs_arr)
                 prior_p2 = pt.clip(prior_p2, eps, 1.0 - eps)
