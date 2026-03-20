@@ -1108,6 +1108,149 @@ def posterior_misfit_diagnostics(
     }
 
 
+def plot_stereonet_planes_map(
+    all_events: pd.DataFrame,
+    selected_events: pd.DataFrame,
+    output_png,
+    color_column: str = "instability",
+    hemisphere: str = "lower",
+) -> bool:
+    """Plot selected planes as map-positioned stereonet traces."""
+    required = {"optimum_strike", "optimum_dip", color_column}
+    if not required.issubset(selected_events.columns):
+        return False
+
+    coord_options = (
+        ("easting", "northing", "Easting [m]", "Northing [m]", 100.0, 100.0),
+        ("lon", "lat", "Longitude", "Latitude", None, None),
+        ("longitude", "latitude", "Longitude", "Latitude", None, None),
+    )
+
+    coords = None
+    for x_col, y_col, x_label, y_label, x_pad, y_pad in coord_options:
+        if {x_col, y_col}.issubset(all_events.columns) and {x_col, y_col}.issubset(
+            selected_events.columns
+        ):
+            coords = (x_col, y_col, x_label, y_label, x_pad, y_pad)
+            break
+
+    if coords is None:
+        return False
+
+    hemi = str(hemisphere or "lower").strip().lower()
+    if hemi not in {"lower", "upper"}:
+        raise ValueError("hemisphere must be either 'lower' or 'upper'")
+
+    x_col, y_col, x_label, y_label, x_pad, y_pad = coords
+
+    from matplotlib.cm import ScalarMappable
+    from matplotlib.markers import MarkerStyle
+    from matplotlib.path import Path as MplPath
+    from matplotlib.transforms import Affine2D
+
+    fig = plt.figure(figsize=(10, 12))
+    ax = fig.add_subplot()
+
+    ax.scatter(
+        all_events[x_col].to_numpy(dtype=float),
+        all_events[y_col].to_numpy(dtype=float),
+        color="k",
+        marker=".",
+        s=1,
+        alpha=0.35,
+        zorder=-9,
+    )
+
+    plot_df = selected_events.copy()
+    if "depth_km" in plot_df.columns:
+        plot_df = plot_df.sort_values(by="depth_km", ascending=False)
+    elif "depth" in plot_df.columns:
+        plot_df = plot_df.sort_values(by="depth", ascending=False)
+
+    cmap = plt.cm.jet
+    cvals = plot_df[color_column].astype(float).values
+    if np.all(np.isnan(cvals)):
+        cvals = np.zeros_like(cvals)
+    vmin = np.nanmin(cvals)
+    vmax = np.nanmax(cvals)
+    if not np.isfinite(vmin) or not np.isfinite(vmax) or np.isclose(vmin, vmax):
+        vmin, vmax = 0.0, 1.0
+    norm = plt.Normalize(vmin=vmin, vmax=vmax)
+
+    def get_stereonet_path(dip: float) -> MplPath:
+        dip = max(0.0, min(90.0, dip))
+        dip_rad = np.radians(dip)
+        lambdas = np.linspace(-np.pi / 2, np.pi / 2, 50)
+        factor = 0.5 / (1.0 + np.cos(lambdas) * np.sin(dip_rad))
+        x_vals = np.cos(lambdas) * np.cos(dip_rad) * factor
+        y_vals = np.sin(lambdas) * factor
+        if hemi == "upper":
+            x_vals = -x_vals
+        verts = list(zip(x_vals, y_vals))
+        codes = [MplPath.MOVETO] + [MplPath.LINETO] * (len(verts) - 1)
+        return MplPath(verts, codes)
+
+    for _, event in plot_df.iterrows():
+        if pd.isna(event.get(x_col)) or pd.isna(event.get(y_col)):
+            continue
+        if pd.isna(event.get("optimum_strike")) or pd.isna(event.get("optimum_dip")):
+            continue
+
+        mag = _row_magnitude(event, default=0.0)
+        size = ((mag + 4.0) ** 2.0) * 12.0
+        rgba = cmap(norm(float(event[color_column])))
+
+        strike = float(event["optimum_strike"])
+        dip = float(event["optimum_dip"])
+
+        base_path = get_stereonet_path(dip)
+        rotated_path = base_path.transformed(Affine2D().rotate_deg(-strike))
+        marker = MarkerStyle(marker=rotated_path)
+
+        ax.scatter(
+            float(event[x_col]),
+            float(event[y_col]),
+            marker=marker,
+            s=size,
+            edgecolors=rgba,
+            facecolors="none",
+            linewidths=1.5,
+            zorder=3,
+        )
+
+    x_all = all_events[x_col].to_numpy(dtype=float)
+    y_all = all_events[y_col].to_numpy(dtype=float)
+    x_min, x_max = np.nanmin(x_all), np.nanmax(x_all)
+    y_min, y_max = np.nanmin(y_all), np.nanmax(y_all)
+
+    if x_pad is None:
+        x_pad = 0.02 * max(x_max - x_min, 0.1)
+    if y_pad is None:
+        y_pad = 0.02 * max(y_max - y_min, 0.1)
+
+    ax.set_xlim(x_min - x_pad, x_max + x_pad)
+    ax.set_ylim(y_min - y_pad, y_max + y_pad)
+
+    sm = ScalarMappable(norm=norm, cmap=cmap)
+    sm.set_array([])
+    cbar = plt.colorbar(sm, ax=ax, pad=0.02, shrink=0.3)
+    cbar.set_label(color_column.replace("_", " ").title(), fontsize=12)
+
+    ax.set_aspect("equal")
+    ax.set_xlabel(x_label, fontsize=12)
+    ax.set_ylabel(y_label, fontsize=12)
+    ax.set_title("Selected Planes", fontsize=16)
+    try:
+        ax.ticklabel_format(useOffset=False, style="plain")
+    except Exception:
+        pass
+
+    fig.tight_layout()
+    fig.savefig(output_png, dpi=300)
+    plt.close(fig)
+    return True
+
+
 def _row_magnitude(row: pd.Series, default: float = 3.0) -> float:
     for key in ("mw", "ml", "md", "ma", "magnitude"):
         if key in row.index:

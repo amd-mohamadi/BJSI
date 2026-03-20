@@ -17,12 +17,13 @@ import joblib
 import numpy as np
 import pandas as pd
 
+from bjsi import Bayesian_joint_plane_selection_NUTS
 import ilsi
 import utils_stress
-from bjsi import Bayesian_joint_plane_selection_NUTS
 from plot_stress_output import (
     generate_figures_hdi,
     arviz_uncertainty_metrics,
+    plot_stereonet_planes_map,
     write_arviz_outputs,
     posterior_misfit_diagnostics,
     plot_focal_mechanisms_map,
@@ -39,8 +40,11 @@ NUTS_CORES = 4
 NUTS_TARGET_ACCEPT = 0.8
 NUTS_SAMPLER = "nutpie"
 NUTS_SAMPLER_KWARGS = None
-SELECTION_BETA = 8.0
-TAU_WEIGHT_EXPONENT = 0.5
+SELECTION_BETA = 10.0
+TAU_WEIGHT_EXPONENT = 0.6
+SLIP_LIKELIHOOD = "von_mises_fisher"
+SLIP_VMF_KAPPA = 8.0
+CLUSTERING_PRIOR_STRENGTH = 2.0
 
 
 def _load_catalog(path: Path) -> pd.DataFrame:
@@ -66,8 +70,6 @@ def _load_catalog(path: Path) -> pd.DataFrame:
         df["rake2"] = rakes_2
 
     return df
-
-
 def main() -> None:
     catalog_path = REPO_ROOT / "examples" / "data" / "Geyser_2007_2020.csv"
     if not catalog_path.exists():
@@ -80,8 +82,9 @@ def main() -> None:
             )
 
     focals = _load_catalog(catalog_path)
+    # focals = focals[:200]
 
-    out_path = REPO_ROOT / "Geysers_output"
+    out_path = REPO_ROOT / "Geysers_output_gaussian"
     out_path.mkdir(exist_ok=True)
 
     strikes_1 = focals["strike1"].to_numpy(dtype=float)
@@ -113,7 +116,10 @@ def main() -> None:
         likelihood_weight_mode="event",
         tau_weight_exponent=TAU_WEIGHT_EXPONENT,
         selection_beta=SELECTION_BETA,
+        slip_likelihood=SLIP_LIKELIHOOD,
+        slip_vmf_kappa=SLIP_VMF_KAPPA,
         normalize_tau_weights=True,
+        clustering_prior_strength=CLUSTERING_PRIOR_STRENGTH,
     )
 
     R = float(inversion_output["R_median"])
@@ -211,12 +217,19 @@ def main() -> None:
     )
 
     (out_path / "figures").mkdir(exist_ok=True)
-    plot_focal_mechanisms_map(
+    # plot_focal_mechanisms_map(
+    #     all_events=focals,
+    #     selected_events=out_focals,
+    #     output_png=str(out_path / "figures" / "top_view.png"),
+    #     color_column="instability",
+    #     use_cartopy=True,
+    # )
+
+    plot_stereonet_planes_map(
         all_events=focals,
         selected_events=out_focals,
-        output_png=str(out_path / "figures" / "top_view.png"),
+        output_png=out_path / "figures" / "selected_planes_topview.png",
         color_column="instability",
-        use_cartopy=True,
     )
 
 

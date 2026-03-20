@@ -9,7 +9,7 @@ stress parameters and nodal plane selection in a single probabilistic model.
 Key features:
 - Joint inference of stress orientation, shape ratio, and plane selection
 - Optional friction coefficient inference (sampled in NUTS; in SMC either sampled or post hoc)
-- Gaussian slip-direction likelihood with optional tau^2 weighting
+- Selectable Gaussian or von Mises-Fisher slip-direction likelihood with optional tau^2 weighting
 - Instability-based plane-selection prior (Mohr-Coulomb)
 - Handles multimodal posteriors; no bootstrap required (full posterior from single run)
 
@@ -101,6 +101,92 @@ def normal_slip_vectors_batch(strike, dip, rake, direction="inward"):
     return n, slip
 
 
+def _canonicalize_slip_likelihood(slip_likelihood: Optional[str]) -> str:
+    """Normalize the user-facing slip likelihood selector."""
+    likelihood = str(slip_likelihood or "gaussian").strip().lower().replace("-", "_")
+    aliases = {
+        "gaussian": "gaussian",
+        "normal": "gaussian",
+        "vmf": "von_mises_fisher",
+        "vonmisesfisher": "von_mises_fisher",
+        "von_misesfisher": "von_mises_fisher",
+        "von_mises_fisher": "von_mises_fisher",
+    }
+    try:
+        return aliases[likelihood]
+    except KeyError as exc:
+        raise ValueError(
+            "slip_likelihood must be one of {'gaussian', 'von_mises_fisher', 'vmf'}"
+        ) from exc
+
+
+def _resolve_slip_likelihood_params(
+    slip_likelihood: Optional[str],
+    slip_misfit_sigma: float,
+    slip_vmf_kappa: Optional[float],
+) -> Tuple[str, float, Optional[float]]:
+    """Validate and resolve slip-likelihood hyperparameters."""
+    likelihood_name = _canonicalize_slip_likelihood(slip_likelihood)
+
+    sigma = float(slip_misfit_sigma)
+    if not np.isfinite(sigma):
+        raise ValueError("slip_misfit_sigma must be finite")
+
+    kappa_val = None
+    if slip_vmf_kappa is not None:
+        kappa_val = float(slip_vmf_kappa)
+        if not np.isfinite(kappa_val) or kappa_val <= 0.0:
+            raise ValueError("slip_vmf_kappa must be finite and > 0")
+
+    if likelihood_name == "gaussian" or kappa_val is None:
+        if sigma <= 0.0:
+            raise ValueError("slip_misfit_sigma must be > 0")
+
+    if likelihood_name == "von_mises_fisher":
+        if kappa_val is None:
+            kappa_val = 1.0 / (sigma**2)
+        if not np.isfinite(kappa_val) or kappa_val <= 0.0:
+            raise ValueError("Resolved vMF concentration must be finite and > 0")
+
+    return likelihood_name, sigma, kappa_val
+
+
+def _slip_direction_logp(
+    s_obs,
+    s_pred,
+    *,
+    family: str,
+    sigma: float,
+    vmf_kappa: Optional[float],
+    weight=1.0,
+):
+    """Return per-event slip-direction log-likelihoods on unit vectors."""
+    safe_weight = pt.clip(pt.as_tensor_variable(weight), 1e-12, 1e12)
+
+    obs_norm = pt.sqrt(pt.sum(pt.square(s_obs), axis=-1, keepdims=True))
+    pred_norm = pt.sqrt(pt.sum(pt.square(s_pred), axis=-1, keepdims=True))
+    s_obs_unit = s_obs / (obs_norm + 1e-12)
+    s_pred_unit = s_pred / (pred_norm + 1e-12)
+
+    if family == "gaussian":
+        diff = s_obs_unit - s_pred_unit
+        sigma2 = float(sigma) ** 2
+        return -0.5 * safe_weight * pt.sum(diff**2, axis=-1) / sigma2 - 1.5 * pt.log(
+            2 * np.pi * (sigma2 / safe_weight)
+        )
+
+    if family != "von_mises_fisher":
+        raise ValueError(f"Unsupported slip likelihood family: {family}")
+    if vmf_kappa is None:
+        raise ValueError("vmf_kappa must be provided for the von_mises_fisher likelihood")
+
+    kappa_eff = safe_weight * float(vmf_kappa)
+    dot = pt.clip(pt.sum(s_obs_unit * s_pred_unit, axis=-1), -1.0, 1.0)
+    log_sinh_kappa = kappa_eff + pt.log(-pt.expm1(-2.0 * kappa_eff)) - np.log(2.0)
+    log_c3 = pt.log(kappa_eff) - np.log(4.0 * np.pi) - log_sinh_kappa
+    return log_c3 + kappa_eff * dot
+
+
 # Import stress_tensor_eigendecomposition from utils_stress
 # (not defined here - use the one from utils_stress module)
 
@@ -135,8 +221,12 @@ def Bayesian_joint_plane_selection_SMC(
     # Plane-selection prior sharpness (sigmoid beta). If None, falls back to instability_beta
     # for backward compatibility.
     selection_beta: Optional[float] = None,
-    # Standard deviation for the Gaussian slip likelihood (in radians roughly).
+    # Scale for the Gaussian slip likelihood (small-angle approximation).
     slip_misfit_sigma: float = 0.35,
+    # Slip-direction likelihood family.
+    slip_likelihood: str = "gaussian",
+    # Concentration for the vMF slip likelihood; defaults to 1 / slip_misfit_sigma**2.
+    slip_vmf_kappa: Optional[float] = None,
     # Back-compat name (historically used for instability-based plane selection).
     # Controls the sharpness of the slip-tendency plane-selection prior when
     # selection_beta is None.
@@ -180,7 +270,7 @@ def Bayesian_joint_plane_selection_SMC(
     - Naturally handles multimodal posteriors (e.g., 180-degree stress orientation symmetries)
     - Propagates plane-selection uncertainty into stress parameter estimates
     - Optionally estimates friction coefficient mu post hoc from the inferred stress
-    - Uses a Gaussian slip-direction misfit (optionally weighted by tau^2)
+    - Uses a selectable Gaussian or von Mises-Fisher slip-direction misfit
 
     By default plane selection uses a soft instability prior derived from the
     Mohr-Coulomb criterion:
@@ -259,6 +349,16 @@ def Bayesian_joint_plane_selection_SMC(
         inversion on those fixed planes (no latent z). Plane probabilities are one-hot and 
         the selected μ is returned in results["friction_coefficient_preselected"].
         If False (default), use the joint Bayesian selection with an instability-driven prior.
+    slip_likelihood : {"gaussian", "von_mises_fisher"}, default "gaussian"
+        Slip-direction likelihood family. The Gaussian option uses the historical
+        small-angle proxy on the unit slip vectors, while `von_mises_fisher` uses a
+        true directional likelihood on the sphere.
+    slip_misfit_sigma : float, default 0.35
+        Scale parameter for the Gaussian slip likelihood. When
+        `slip_vmf_kappa` is not provided, the vMF path uses the small-angle mapping
+        `kappa ~= 1 / slip_misfit_sigma**2`.
+    slip_vmf_kappa : float, optional
+        Explicit concentration parameter for the vMF slip likelihood. Must be > 0.
     instability_beta : float, default 6.0
         Temperature for the instability prior (higher → closer to hard argmax). Typical 2–12.
     signed_instability : bool, default False
@@ -318,7 +418,7 @@ def Bayesian_joint_plane_selection_SMC(
     -----
     - This function requires PyMC with SMC support (pm.sample_smc)
     - The model uses a quaternion parameterization for stress orientation to avoid gimbal lock
-    - Uses a Gaussian slip-direction misfit (small-angle approximation), optionally weighted by tau^2
+    - Uses a selectable Gaussian or vMF slip-direction likelihood, optionally weighted by tau^2
     - SMC is robust to multimodal posteriors; plane choice is marginalized via a two-plane mixture
     - Typical runtime: ~30s-2min for N=20-50 events with default parameters
     - **Recommended for N < 50 events due to particle degeneracy in high-dimensional posteriors**
@@ -454,6 +554,14 @@ def Bayesian_joint_plane_selection_SMC(
     if clustering_prior_strength < 0.0:
         raise ValueError("clustering_prior_strength must be >= 0")
 
+    slip_likelihood_name, slip_misfit_sigma, slip_vmf_kappa_val = (
+        _resolve_slip_likelihood_params(
+            slip_likelihood,
+            slip_misfit_sigma,
+            slip_vmf_kappa,
+        )
+    )
+
     # --------------------------------------------------------
     # Optional iterative preselection (Michael + instability)
     # --------------------------------------------------------
@@ -571,20 +679,6 @@ def Bayesian_joint_plane_selection_SMC(
         ts = t - tn  # Shear component (N, 3)
         return unit_vector(ts)
 
-    def gaussian_logp(s_obs, s_pred, sigma=0.2, weight=1.0):
-        """
-        Gaussian log-likelihood for slip direction mismatch.
-        s_obs, s_pred: (N, 3) unit vectors
-        sigma: scalar standard deviation (approx angular uncertainty in radians)
-        weight: (N,) or scalar, scales the precision (e.g. weight=tau^2)
-        """
-        # Approximating angular mismatch on the sphere with Euclidean distance
-        # For small angles, |s_obs - s_pred| approx theta.
-        diff = s_obs - s_pred
-        # Weighting: effective precision is 1/sigma^2 * weight
-        # logp = -0.5 * weight * diff^2 / sigma^2
-        return -0.5 * weight * pt.sum(diff**2, axis=-1) / (sigma**2) - 1.5 * pt.log(2 * np.pi * (sigma**2 / (weight + 1e-9)))
-
     def _apply_weight_clip(w, clip):
         if clip is None:
             return w
@@ -596,7 +690,7 @@ def Bayesian_joint_plane_selection_SMC(
     def _tau_weights(tau1, tau2):
         """
         Compute (w1, w2) weights for the two-plane mixture likelihood.
-        Returned arrays have shape (N,) and can be multiplied into `gaussian_logp(..., weight=...)`.
+        Returned arrays have shape (N,) and are passed to the slip-direction likelihood.
         """
         if not weighted_likelihood:
             return pt.ones_like(tau1), pt.ones_like(tau2)
@@ -705,15 +799,24 @@ def Bayesian_joint_plane_selection_SMC(
             # Likelihood on the selected plane
             s_predicted = shear_traction_direction(Sigma, n_selected)  # (N, 3)
             tau_mag = shear_magnitude(Sigma, n_selected)  # (N,)
-            sigma = slip_misfit_sigma
             if weighted_likelihood:
                 w_tau = _tau_weights(tau_mag, tau_mag)[0]
-                loglike_per_event = gaussian_logp(
-                    s_observed, s_predicted, sigma, weight=w_event * w_tau
+                loglike_per_event = _slip_direction_logp(
+                    s_observed,
+                    s_predicted,
+                    family=slip_likelihood_name,
+                    sigma=slip_misfit_sigma,
+                    vmf_kappa=slip_vmf_kappa_val,
+                    weight=w_event * w_tau,
                 )
             else:
-                loglike_per_event = gaussian_logp(
-                    s_observed, s_predicted, sigma, weight=w_event
+                loglike_per_event = _slip_direction_logp(
+                    s_observed,
+                    s_predicted,
+                    family=slip_likelihood_name,
+                    sigma=slip_misfit_sigma,
+                    vmf_kappa=slip_vmf_kappa_val,
+                    weight=w_event,
                 )
             pm.Potential("likelihood", pt.sum(loglike_per_event))
         else:
@@ -757,8 +860,22 @@ def Bayesian_joint_plane_selection_SMC(
             w1 = w_event * w1_tau
             w2 = w_event * w2_tau
 
-            ll1 = gaussian_logp(s1, s_pred1, slip_misfit_sigma, weight=w1)
-            ll2 = gaussian_logp(s2, s_pred2, slip_misfit_sigma, weight=w2)
+            ll1 = _slip_direction_logp(
+                s1,
+                s_pred1,
+                family=slip_likelihood_name,
+                sigma=slip_misfit_sigma,
+                vmf_kappa=slip_vmf_kappa_val,
+                weight=w1,
+            )
+            ll2 = _slip_direction_logp(
+                s2,
+                s_pred2,
+                family=slip_likelihood_name,
+                sigma=slip_misfit_sigma,
+                vmf_kappa=slip_vmf_kappa_val,
+                weight=w2,
+            )
 
             inst_delta = inst2 - inst1
             beta_val = float(instability_beta if selection_beta is None else selection_beta)
@@ -1125,8 +1242,12 @@ def Bayesian_joint_plane_selection_NUTS(
     # Plane-selection prior sharpness (sigmoid beta). If None, falls back to instability_beta
     # for backward compatibility.
     selection_beta: Optional[float] = None,
-    # Standard deviation for the Gaussian slip likelihood (in radians roughly).
+    # Scale for the Gaussian slip likelihood (small-angle approximation).
     slip_misfit_sigma: float = 0.35,
+    # Slip-direction likelihood family.
+    slip_likelihood: str = "gaussian",
+    # Concentration for the vMF slip likelihood; defaults to 1 / slip_misfit_sigma**2.
+    slip_vmf_kappa: Optional[float] = None,
     # Back-compat name (historically used for instability-based plane selection).
     # Now only controls the sharpness of the slip-tendency plane-selection prior when
     # selection_beta is None.
@@ -1164,9 +1285,9 @@ def Bayesian_joint_plane_selection_NUTS(
 
         p(data_i | stress) = p1_i * L1_i + p2_i * L2_i
 
-    where L1_i and L2_i are Gaussian slip-direction likelihoods for plane 1 and plane 2 respectively
-    (optionally weighted by tau^2), and (p1_i, p2_i) is a soft instability-based prior derived
-    from the Mohr-Coulomb criterion (depends on mu).
+    where L1_i and L2_i are slip-direction likelihoods for plane 1 and plane 2 respectively
+    (Gaussian or von Mises-Fisher, optionally weighted by tau^2), and (p1_i, p2_i) is a
+    soft instability-based prior derived from the Mohr-Coulomb criterion (depends on mu).
 
     The returned plane probabilities correspond to the posterior responsibilities of the mixture,
     averaged over posterior draws: E[p(z_i=1 | params, data_i)].
@@ -1250,6 +1371,14 @@ def Bayesian_joint_plane_selection_NUTS(
     clustering_prior_strength = float(clustering_prior_strength)
     if clustering_prior_strength < 0.0:
         raise ValueError("clustering_prior_strength must be >= 0")
+
+    slip_likelihood_name, slip_misfit_sigma, slip_vmf_kappa_val = (
+        _resolve_slip_likelihood_params(
+            slip_likelihood,
+            slip_misfit_sigma,
+            slip_vmf_kappa,
+        )
+    )
 
     # --------------------------------------------------------
     # Optional iterative preselection (Michael + instability)
@@ -1345,20 +1474,6 @@ def Bayesian_joint_plane_selection_NUTS(
         ts_comp = t_full - tn_comp
         return pt.sqrt(pt.sum(pt.square(ts_comp), axis=-1) + 1e-12)
 
-    def gaussian_logp(s_obs, s_pred, sigma=0.2, weight=1.0):
-        """
-        Gaussian log-likelihood for slip direction mismatch.
-        s_obs, s_pred: (N, 3) unit vectors
-        sigma: scalar standard deviation (approx angular uncertainty in radians)
-        weight: (N,) or scalar, scales the precision (e.g. weight=tau^2)
-        """
-        # Approximating angular mismatch on the sphere with Euclidean distance
-        # For small angles, |s_obs - s_pred| approx theta.
-        diff = s_obs - s_pred
-        # Weighting: effective precision is 1/sigma^2 * weight
-        # logp = -0.5 * weight * diff^2 / sigma^2
-        return -0.5 * weight * pt.sum(diff**2, axis=-1) / (sigma**2) - 1.5 * pt.log(2 * np.pi * (sigma**2 / (weight + 1e-9)))
-
     def _apply_weight_clip(w, clip):
         if clip is None:
             return w
@@ -1449,13 +1564,26 @@ def Bayesian_joint_plane_selection_NUTS(
             n_selected = pm.Data("n_selected", iterative_info["n_selected"])
             s_observed = pm.Data("s_observed", iterative_info["s_selected"])
             s_pred = shear_traction_direction(Sigma, n_selected)
-            sigma = slip_misfit_sigma
             tau_mag = shear_magnitude(Sigma, n_selected)
             if weighted_likelihood:
                 w_tau = _tau_weights(tau_mag, tau_mag)[0]
-                ll = gaussian_logp(s_observed, s_pred, sigma, weight=w_event * w_tau)
+                ll = _slip_direction_logp(
+                    s_observed,
+                    s_pred,
+                    family=slip_likelihood_name,
+                    sigma=slip_misfit_sigma,
+                    vmf_kappa=slip_vmf_kappa_val,
+                    weight=w_event * w_tau,
+                )
             else:
-                ll = gaussian_logp(s_observed, s_pred, sigma, weight=w_event)
+                ll = _slip_direction_logp(
+                    s_observed,
+                    s_pred,
+                    family=slip_likelihood_name,
+                    sigma=slip_misfit_sigma,
+                    vmf_kappa=slip_vmf_kappa_val,
+                    weight=w_event,
+                )
             pm.Potential("likelihood", pt.sum(ll))
             # Fix scoper for post-processing
             p_plane2_post = pm.Deterministic("p_plane2_post", pt.as_tensor_variable(iterative_info["plane_map"].astype(float)))
@@ -1501,8 +1629,22 @@ def Bayesian_joint_plane_selection_NUTS(
             w1 = w_event * w1_tau
             w2 = w_event * w2_tau
 
-            ll1 = gaussian_logp(s1, s_pred1, slip_misfit_sigma, weight=w1)
-            ll2 = gaussian_logp(s2, s_pred2, slip_misfit_sigma, weight=w2)
+            ll1 = _slip_direction_logp(
+                s1,
+                s_pred1,
+                family=slip_likelihood_name,
+                sigma=slip_misfit_sigma,
+                vmf_kappa=slip_vmf_kappa_val,
+                weight=w1,
+            )
+            ll2 = _slip_direction_logp(
+                s2,
+                s_pred2,
+                family=slip_likelihood_name,
+                sigma=slip_misfit_sigma,
+                vmf_kappa=slip_vmf_kappa_val,
+                weight=w2,
+            )
 
             inst_delta = (inst2 - inst1)
             beta_val = float(instability_beta if selection_beta is None else selection_beta)
