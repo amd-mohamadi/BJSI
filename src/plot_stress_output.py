@@ -76,10 +76,11 @@ def _plot_mohr(
     dips = focals["optimum_dip"].values
     rakes = focals["optimum_rake"].values
 
-    normals, slips = utils_stress.normal_slip_vectors(
+    from bjsi import normal_slip_vectors_batch  # type: ignore
+
+    normals, _slips = normal_slip_vectors_batch(
         strikes, dips, np.zeros_like(strikes)
     )
-    normals, slips = normals.T, slips.T
     traction, normal_traction, shear_traction = utils_stress.compute_traction(
         stress_tensor, normals
     )
@@ -256,6 +257,8 @@ def _plot_single_method_output_panels(
     axes=None,
     marker: str = "o",
     color: str = "b",
+    reference_R: Optional[float] = None,
+    reference_principal_directions: Optional[np.ndarray] = None,
 ):
     """Plot stereonet, shape-ratio histogram, and shear-stress histogram."""
 
@@ -293,7 +296,7 @@ def _plot_single_method_output_panels(
     else:
         ax1_local, ax2_local, ax3_local = axes
 
-    n_resamplings = inversion_output["boot_principal_directions"].shape[0]
+    n_resamplings = inversion_output["posterior_principal_directions"].shape[0]
     ax1_local.grid(True, kind="polar", linestyle=":")
     for label in ax1_local.get_xticklabels() + ax1_local.get_yticklabels():
         label.set_fontsize(16)
@@ -306,7 +309,7 @@ def _plot_single_method_output_panels(
 
     Rs_all = np.zeros(n_resamplings, dtype=np.float32)
     for b in range(n_resamplings):
-        Rs_all[b] = utils_stress_mod.R_(inversion_output["boot_principal_stresses"][b, :])
+        Rs_all[b] = utils_stress_mod.R_(inversion_output["posterior_principal_stresses"][b, :])
 
     if use_hdi_samples and r_interval is not None:
         lo, hi = r_interval
@@ -344,10 +347,26 @@ def _plot_single_method_output_panels(
             zorder=2,
         )
 
+        if reference_principal_directions is not None:
+            ref_az, ref_pl = utils_stress_mod.get_bearing_plunge(
+                np.asarray(reference_principal_directions)[:, k]
+            )
+            ax1_local.line(
+                ref_pl,
+                ref_az,
+                marker="*",
+                markeredgecolor="k",
+                markeredgewidth=1.2,
+                markerfacecolor=principal_colors[k],
+                markersize=18,
+                zorder=3,
+                linestyle="None",
+            )
+
         boot_pd_stereo = np.zeros((n_resamplings, 2), dtype=np.float32)
         for b in range(n_resamplings):
             boot_pd_stereo[b, :] = utils_stress_mod.get_bearing_plunge(
-                inversion_output["boot_principal_directions"][b, :, k]
+                inversion_output["posterior_principal_directions"][b, :, k]
             )
 
         count, lons_g, lats_g, ci_levels = utils_stress_mod.get_CI_levels(
@@ -384,7 +403,7 @@ def _plot_single_method_output_panels(
             boot_pd_to_plot = np.zeros((keep_idx.size, 2), dtype=np.float32)
             for j, b in enumerate(keep_idx):
                 boot_pd_to_plot[j, :] = utils_stress_mod.get_bearing_plunge(
-                    inversion_output["boot_principal_directions"][b, :, k]
+                    inversion_output["posterior_principal_directions"][b, :, k]
                 )
             azs = np.mod(boot_pd_to_plot[:, 0], 360.0)
             pls = boot_pd_to_plot[:, 1]
@@ -417,6 +436,16 @@ def _plot_single_method_output_panels(
     ax2_local.set_ylabel("Number of Bootstrap Samples", fontsize=15)
     if show_hdi_on_hist:
         ax2_local.axvspan(R_lo, R_hi, color=color, alpha=0.15, label=r_legend_label)
+    if reference_R is not None:
+        ax2_local.axvline(
+            float(reference_R),
+            color="red",
+            linestyle="--",
+            linewidth=2.0,
+            label=f"True R={float(reference_R):.2f}",
+            zorder=5,
+        )
+    if show_hdi_on_hist or reference_R is not None:
         ax2_local.legend(loc="upper right", fontsize=12)
 
     fp_strikes = focals["optimum_strike"].values
@@ -540,6 +569,9 @@ def _generate_figures_core(
     interval_label: str = "CI",
     use_hdi_samples: bool = False,
     show_hdi_on_mohr: bool = False,
+    figure_names: Optional[Sequence[str]] = None,
+    reference_R: Optional[float] = None,
+    reference_principal_directions: Optional[np.ndarray] = None,
 ) -> Dict[str, str]:
     """
     Generate Mohr plots, PT axes and the stereonet/cloud plot using the provided data files.
@@ -547,6 +579,10 @@ def _generate_figures_core(
     Returns a dict mapping logical figure names -> saved file paths.
     """
     os.makedirs(output_dir, exist_ok=True)
+    _wanted = None if figure_names is None else set(figure_names)
+
+    def _want(name: str) -> bool:
+        return _wanted is None or name in _wanted
 
     # ensure local ilsi/utils_stress available
     global ilsi, utils_stress
@@ -587,7 +623,7 @@ def _generate_figures_core(
 
     # 1) Mohr plot colored by instability
     fig1_path = os.path.join(output_dir, "Mohr_average_stress_instability.png")
-    if overwrite or not os.path.exists(fig1_path):
+    if _want("Mohr_average_stress_instability") and (overwrite or not os.path.exists(fig1_path)):
         fig = plt.figure(figsize=(8, 5))
         ax = fig.add_subplot(111)
         title_lines = [f"mu={mu:.2f}"]
@@ -618,7 +654,7 @@ def _generate_figures_core(
 
     # 4) PT axes stereonet
     pt_path = os.path.join(output_dir, "PT_axes.png")
-    if overwrite or not os.path.exists(pt_path):
+    if _want("PT_axes") and (overwrite or not os.path.exists(pt_path)):
         _plot_PT_axes(
             pt_path,
             focals["optimum_strike"].values,
@@ -631,7 +667,7 @@ def _generate_figures_core(
     sel_planes_path = os.path.join(output_dir, "selected_planes.png")
     aux_planes_path = os.path.join(output_dir, "aux_planes.png")
 
-    if (
+    if (_want("selected_planes") or _want("aux_planes")) and (
         overwrite
         or not os.path.exists(sel_planes_path)
         or not os.path.exists(aux_planes_path)
@@ -643,14 +679,15 @@ def _generate_figures_core(
         sel_instability = focals["instability"].values
 
         # Plot Selected
-        _plot_stereonet_instability(
-            sel_planes_path,
-            sel_strikes,
-            sel_dips,
-            sel_rakes,
-            sel_instability,
-            "Selected Planes Instability",
-        )
+        if _want("selected_planes"):
+            _plot_stereonet_instability(
+                sel_planes_path,
+                sel_strikes,
+                sel_dips,
+                sel_rakes,
+                sel_instability,
+                "Selected Planes Instability",
+            )
 
         # Prepare Data for Aux
         # 1. Identify aux parameters
@@ -704,14 +741,15 @@ def _generate_figures_core(
             aux_instability = np.zeros_like(aux_strikes)
 
         # Plot Aux
-        _plot_stereonet_instability(
-            aux_planes_path,
-            aux_strikes,
-            aux_dips,
-            aux_rakes,
-            aux_instability,
-            "Auxiliary Planes Instability",
-        )
+        if _want("aux_planes"):
+            _plot_stereonet_instability(
+                aux_planes_path,
+                aux_strikes,
+                aux_dips,
+                aux_rakes,
+                aux_instability,
+                "Auxiliary Planes Instability",
+            )
 
         generated_paths = {
             "mohr_instability": fig1_path,
@@ -772,6 +810,8 @@ def _generate_figures_core(
             bootstrap_max_points=bootstrap_max_points,
             save_separate=do_separate,
             axes=axes,
+            reference_R=reference_R,
+            reference_principal_directions=reference_principal_directions,
         )
 
         handles, labels = _build_stereonet_legend(
@@ -807,14 +847,18 @@ def _generate_figures_core(
                 frameon=True,
                 fontsize=14,
             )
-            figs[0].savefig(separate_paths["stereonet_directions"], dpi=200, bbox_inches="tight")
-            figs[1].savefig(separate_paths["shape_ratio_histogram"], dpi=200, bbox_inches="tight")
-            figs[2].savefig(separate_paths["shear_stress_histogram"], dpi=200, bbox_inches="tight")
+            if _want("stereonet_directions"):
+                figs[0].savefig(separate_paths["stereonet_directions"], dpi=200, bbox_inches="tight")
+                generated_paths["stereonet_directions"] = separate_paths["stereonet_directions"]
+            if _want("shape_ratio_histogram"):
+                figs[1].savefig(separate_paths["shape_ratio_histogram"], dpi=200, bbox_inches="tight")
+                generated_paths["shape_ratio_histogram"] = separate_paths["shape_ratio_histogram"]
+            if _want("shear_stress_histogram"):
+                figs[2].savefig(separate_paths["shear_stress_histogram"], dpi=200, bbox_inches="tight")
+                generated_paths["shear_stress_histogram"] = separate_paths["shear_stress_histogram"]
 
             for f in figs:
                 plt.close(f)
-
-            generated_paths.update(separate_paths)
 
     return generated_paths
 
@@ -869,6 +913,9 @@ def generate_figures_hdi(
     save_separate: bool = True,
     overwrite: bool = True,
     use_hdi_samples: bool = True,
+    figure_names: Optional[Sequence[str]] = None,
+    reference_R: Optional[float] = None,
+    reference_principal_directions: Optional[np.ndarray] = None,
 ) -> Dict[str, str]:
     """
     Generate Mohr plots, PT axes and stereonet outputs using Bayesian HDI summaries.
@@ -899,6 +946,9 @@ def generate_figures_hdi(
         interval_label="HDI",
         use_hdi_samples=use_hdi_samples,
         show_hdi_on_mohr=True,
+        figure_names=figure_names,
+        reference_R=reference_R,
+        reference_principal_directions=reference_principal_directions,
     )
 
 

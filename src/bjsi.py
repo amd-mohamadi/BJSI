@@ -171,8 +171,8 @@ def _slip_direction_logp(
     if family == "gaussian":
         diff = s_obs_unit - s_pred_unit
         sigma2 = float(sigma) ** 2
-        return -0.5 * safe_weight * pt.sum(diff**2, axis=-1) / sigma2 - 1.5 * pt.log(
-            2 * np.pi * (sigma2 / safe_weight)
+        return -0.5 * safe_weight * pt.sum(diff**2, axis=-1) / sigma2 - 1.5 * np.log(
+            2 * np.pi * sigma2
         )
 
     if family != "von_mises_fisher":
@@ -180,15 +180,344 @@ def _slip_direction_logp(
     if vmf_kappa is None:
         raise ValueError("vmf_kappa must be provided for the von_mises_fisher likelihood")
 
-    kappa_eff = safe_weight * float(vmf_kappa)
+    kappa_base = float(vmf_kappa)
+    kappa_eff = safe_weight * kappa_base
     dot = pt.clip(pt.sum(s_obs_unit * s_pred_unit, axis=-1), -1.0, 1.0)
-    log_sinh_kappa = kappa_eff + pt.log(-pt.expm1(-2.0 * kappa_eff)) - np.log(2.0)
-    log_c3 = pt.log(kappa_eff) - np.log(4.0 * np.pi) - log_sinh_kappa
+    log_sinh_kappa = kappa_base + np.log(-np.expm1(-2.0 * kappa_base)) - np.log(2.0)
+    log_c3 = np.log(kappa_base) - np.log(4.0 * np.pi) - log_sinh_kappa
     return log_c3 + kappa_eff * dot
 
 
 # Import stress_tensor_eigendecomposition from utils_stress
 # (not defined here - use the one from utils_stress module)
+
+
+def _build_joint_model(
+    *,
+    n1, n2, s1, s2,
+    q_prior_mu_arr, q_prior_sigma,
+    R_prior_mu_val, R_prior_sigma,
+    infer_friction: bool,
+    infer_friction_method: Optional[str],
+    friction_fixed: Optional[float],
+    friction_prior_params: Tuple[float, float],
+    friction_range: Tuple[float, float],
+    iterative_plane_selection: bool,
+    iterative_info: Dict[str, Any],
+    event_weights: Optional[np.ndarray],
+    weighted_likelihood: bool,
+    likelihood_weight_mode: str,
+    tau_weight_exponent: float,
+    normalize_tau_weights: bool,
+    tau_weight_clip: Optional[Tuple[float, float]],
+    slip_likelihood_name: str,
+    slip_misfit_sigma: float,
+    slip_vmf_kappa_val: Optional[float],
+    instability_beta: float,
+    selection_beta: Optional[float],
+    signed_instability: bool,
+    clustering_prior_strength: float,
+    plane2_prior_probs_arr: Optional[np.ndarray],
+    plane_prior_strength: float,
+    enforce_constant_shear: bool,
+    shear_weight: float,
+    shear_sigma: float,
+    shear_center: str,
+    shear_target: Optional[float],
+    shear_target_sigma: float,
+) -> Tuple["pm.Model", Optional[float]]:
+    """Build the joint PyMC model shared by the SMC and NUTS entry points.
+
+    Returns ``(model, mu_const)`` where ``mu_const`` is the Python float used
+    for fixed-friction posterior reporting (``None`` when μ is sampled).
+    """
+
+    def quat_to_rotation_matrix(q):
+        w, x, y, z = q[0], q[1], q[2], q[3]
+        R11 = 1 - 2 * (y * y + z * z)
+        R22 = 1 - 2 * (x * x + z * z)
+        R33 = 1 - 2 * (x * x + y * y)
+        R12 = 2 * (x * y - z * w); R21 = 2 * (x * y + z * w)
+        R13 = 2 * (x * z + y * w); R31 = 2 * (x * z - y * w)
+        R23 = 2 * (y * z - x * w); R32 = 2 * (y * z + x * w)
+        return pt.stacklists([[R11, R12, R13], [R21, R22, R23], [R31, R32, R33]])
+
+    def stress_tensor_from_R_and_shape(Rmat, Rratio):
+        sig1 = -1.0
+        sig2 = 2.0 * Rratio - 1.0
+        sig3 = 1.0
+        diag_vals = pt.stack([sig1, sig2, sig3])
+        RD = Rmat * diag_vals
+        return pt.dot(RD, Rmat.T)
+
+    def unit_vector(x, eps=1e-12):
+        norm = pt.sqrt(pt.sum(pt.square(x), axis=-1, keepdims=True))
+        return x / (norm + eps)
+
+    def shear_magnitude(Sigma, n):
+        t = pt.dot(Sigma, n.T).T
+        tn = pt.sum(t * n, axis=-1, keepdims=True) * n
+        ts = t - tn
+        return pt.sqrt(pt.sum(pt.square(ts), axis=-1) + 1e-12)
+
+    def shear_traction_direction(Sigma, n):
+        t = pt.dot(Sigma, n.T).T
+        tn = pt.sum(t * n, axis=-1, keepdims=True) * n
+        ts = t - tn
+        return unit_vector(ts)
+
+    def _apply_weight_clip(w, clip):
+        if clip is None:
+            return w
+        lo, hi = float(clip[0]), float(clip[1])
+        if lo <= 0.0 or hi <= 0.0 or hi < lo:
+            raise ValueError("tau_weight_clip must be (low>0, high>0, high>=low)")
+        return pt.clip(w, lo, hi)
+
+    def _tau_weights(tau1, tau2):
+        if not weighted_likelihood:
+            return pt.ones_like(tau1), pt.ones_like(tau2)
+
+        mode = str(likelihood_weight_mode or "plane").lower()
+        p = float(tau_weight_exponent)
+        if p < 0.0:
+            raise ValueError("tau_weight_exponent must be >= 0")
+
+        if normalize_tau_weights:
+            tau_scale = pt.mean(0.5 * (tau1 + tau2)) + 1e-12
+        else:
+            tau_scale = 1.0
+
+        if mode in {"plane", "plane_specific"}:
+            w1 = (tau1 / tau_scale) ** p
+            w2 = (tau2 / tau_scale) ** p
+        elif mode in {"event", "common", "symmetric"}:
+            tau_evt = 0.5 * (tau1 + tau2)
+            w_evt = (tau_evt / tau_scale) ** p
+            w1 = w_evt
+            w2 = w_evt
+        elif mode in {"none", "off"}:
+            w1 = pt.ones_like(tau1)
+            w2 = pt.ones_like(tau2)
+        else:
+            raise ValueError("likelihood_weight_mode must be one of {'plane','event','none'}")
+
+        w1 = _apply_weight_clip(w1, tau_weight_clip)
+        w2 = _apply_weight_clip(w2, tau_weight_clip)
+        return w1, w2
+
+    mu_const: Optional[float] = None
+
+    with pm.Model() as model:
+        # --- Stress orientation as unit quaternion ---
+        if q_prior_mu_arr is not None:
+            q_raw = pm.Normal("q_raw", mu=q_prior_mu_arr, sigma=q_prior_sigma, shape=4)
+        else:
+            q_raw = pm.Normal("q_raw", mu=0.0, sigma=1.0, shape=4)
+        q_norm = pt.sqrt(pt.sum(pt.square(q_raw))) + 1e-8
+        q = q_raw / q_norm
+        Rmat = pm.Deterministic("R_matrix", quat_to_rotation_matrix(q))
+
+        # --- Shape ratio R ∈ (0,1) ---
+        if R_prior_mu_val is not None:
+            Rratio = pm.TruncatedNormal(
+                "R", mu=R_prior_mu_val, sigma=R_prior_sigma, lower=0.001, upper=0.999
+            )
+        else:
+            Rratio = pm.Beta("R", alpha=2.0, beta=2.0)
+
+        Sigma = pm.Deterministic("Sigma", stress_tensor_from_R_and_shape(Rmat, Rratio))
+
+        # --- Friction coefficient (μ) ---
+        if iterative_plane_selection:
+            mu_const = float(
+                iterative_info.get("mu", 0.5 * (friction_range[0] + friction_range[1]))
+            )
+            mu = pm.Deterministic("mu", pt.as_tensor_variable(mu_const))
+        else:
+            method = str(infer_friction_method or "sample").lower()
+            if infer_friction and method == "sample":
+                mu_raw = pm.Beta(
+                    "mu_raw",
+                    alpha=float(friction_prior_params[0]),
+                    beta=float(friction_prior_params[1]),
+                )
+                mu = pm.Deterministic(
+                    "mu",
+                    float(friction_range[0])
+                    + (float(friction_range[1]) - float(friction_range[0])) * mu_raw,
+                )
+            else:
+                mu_const = (
+                    float(friction_fixed)
+                    if friction_fixed is not None
+                    else 0.5 * (friction_range[0] + friction_range[1])
+                )
+                mu = pm.Deterministic("mu", pt.as_tensor_variable(mu_const))
+
+        # --- Optional (stress-independent) event weights ---
+        if event_weights is not None:
+            w_event = pm.Data("event_weights", event_weights)
+            w_event = pt.clip(w_event, 1e-12, 1e12)
+        else:
+            w_event = 1.0
+
+        # --- Likelihood: either fixed planes (preselection) or plane mixture ---
+        if iterative_plane_selection:
+            n_selected = pm.Data("n_selected", iterative_info["n_selected"])
+            s_observed = pm.Data("s_observed", iterative_info["s_selected"])
+            pm.Deterministic(
+                "p_plane2_post",
+                pt.as_tensor_variable(iterative_info["plane_map"].astype(float)),
+            )
+
+            s_predicted = shear_traction_direction(Sigma, n_selected)
+            tau_mag = shear_magnitude(Sigma, n_selected)
+            if weighted_likelihood:
+                w_tau = _tau_weights(tau_mag, tau_mag)[0]
+                loglike_per_event = _slip_direction_logp(
+                    s_observed, s_predicted,
+                    family=slip_likelihood_name,
+                    sigma=slip_misfit_sigma,
+                    vmf_kappa=slip_vmf_kappa_val,
+                    weight=w_event * w_tau,
+                )
+            else:
+                loglike_per_event = _slip_direction_logp(
+                    s_observed, s_predicted,
+                    family=slip_likelihood_name,
+                    sigma=slip_misfit_sigma,
+                    vmf_kappa=slip_vmf_kappa_val,
+                    weight=w_event,
+                )
+            pm.Potential("likelihood", pt.sum(loglike_per_event))
+        else:
+            s_pred1 = shear_traction_direction(Sigma, n1)
+            s_pred2 = shear_traction_direction(Sigma, n2)
+
+            def instability_parameter_log(Sigma, n, mu, R, s_pred=None, s_obs=None):
+                sig1 = -1.0
+                denom = pt.sqrt(1.0 + mu ** 2)
+                tau_c = 1.0 / denom
+                sig_c = mu / denom
+
+                t = pt.dot(Sigma, n.T).T
+                sigma_n = pt.sum(t * n, axis=-1)
+
+                tn = sigma_n[:, None] * n
+                ts = t - tn
+                tau_local = pt.sqrt(pt.sum(ts ** 2, axis=-1) + 1e-12)
+
+                numerator = tau_local - mu * (sig1 - sigma_n)
+                denominator_I = tau_c - mu * (sig1 - sig_c)
+                I_val = numerator / denominator_I
+
+                if signed_instability and s_pred is not None and s_obs is not None:
+                    dot_product = pt.sum(s_pred * s_obs, axis=-1)
+                    I_val = I_val * pt.sign(dot_product)
+
+                return I_val
+
+            tau1 = shear_magnitude(Sigma, n1)
+            tau2 = shear_magnitude(Sigma, n2)
+            inst1 = instability_parameter_log(Sigma, n1, mu, Rratio, s_pred=s_pred1, s_obs=s1)
+            inst2 = instability_parameter_log(Sigma, n2, mu, Rratio, s_pred=s_pred2, s_obs=s2)
+
+            w1_tau, w2_tau = _tau_weights(tau1, tau2)
+            w1 = w_event * w1_tau
+            w2 = w_event * w2_tau
+
+            ll1 = _slip_direction_logp(
+                s1, s_pred1,
+                family=slip_likelihood_name,
+                sigma=slip_misfit_sigma,
+                vmf_kappa=slip_vmf_kappa_val,
+                weight=w1,
+            )
+            ll2 = _slip_direction_logp(
+                s2, s_pred2,
+                family=slip_likelihood_name,
+                sigma=slip_misfit_sigma,
+                vmf_kappa=slip_vmf_kappa_val,
+                weight=w2,
+            )
+
+            inst_delta = inst2 - inst1
+            beta_val = float(instability_beta if selection_beta is None else selection_beta)
+            beta = pt.as_tensor_variable(beta_val)
+            eps = 1e-9
+            logit_local = beta * inst_delta
+
+            # Certainty-weighted clustering prior
+            if clustering_prior_strength > 0.0:
+                p_tentative = pm.math.sigmoid(logit_local)
+                certainty = pt.square(2.0 * p_tentative - 1.0)
+
+                M1 = n1[:, :, None] * n1[:, None, :]
+                M2 = n2[:, :, None] * n2[:, None, :]
+
+                sum_certainty = pt.sum(certainty) + 1e-12
+                T_conf = pt.sum(
+                    certainty[:, None, None] * (
+                        (1.0 - p_tentative)[:, None, None] * M1
+                        + p_tentative[:, None, None] * M2
+                    ),
+                    axis=0,
+                ) / sum_certainty
+
+                E1 = pt.sum(n1 * pt.dot(T_conf, n1.T).T, axis=-1)
+                E2 = pt.sum(n2 * pt.dot(T_conf, n2.T).T, axis=-1)
+
+                logit_local = logit_local + float(clustering_prior_strength) * (E2 - E1)
+
+            if plane2_prior_probs_arr is not None and plane_prior_strength > 0.0:
+                prior_p2 = pt.as_tensor_variable(plane2_prior_probs_arr)
+                prior_p2 = pt.clip(prior_p2, eps, 1.0 - eps)
+                prior_logit = pt.log(prior_p2) - pt.log1p(-prior_p2)
+                p2 = pm.math.sigmoid(logit_local + float(plane_prior_strength) * prior_logit)
+            else:
+                p2 = pm.math.sigmoid(logit_local)
+            p2 = pt.clip(p2, eps, 1.0 - eps)
+            p2 = pm.Deterministic("p_plane2", p2)
+
+            logw1 = pt.log1p(-p2) + ll1
+            logw2 = pt.log(p2) + ll2
+            logmix = pt.logaddexp(logw1, logw2)
+            pm.Potential("likelihood", pt.sum(logmix))
+
+            p_plane2_post = pm.Deterministic("p_plane2_post", pt.exp(logw2 - logmix))
+            tau_mag = (1.0 - p_plane2_post) * tau1 + p_plane2_post * tau2
+
+        # --- Optional: constant-shear constraint ---
+        # Encourages equal shear-traction magnitudes |τ| across events. Under a
+        # uniform stress tensor, |τ| generally varies with fault orientation.
+        if enforce_constant_shear:
+            sw = float(shear_weight)
+            if sw < 0.0:
+                raise ValueError("shear_weight must be >= 0")
+            if sw > 0.0:
+                ss = float(shear_sigma)
+                if ss <= 0.0:
+                    raise ValueError("shear_sigma must be > 0 when enforce_constant_shear=True")
+
+                sc = (shear_center or "mean").lower()
+                if sc not in {"mean", "learned", "fixed"}:
+                    raise ValueError("shear_center must be one of {'mean','learned','fixed'}")
+
+                if sc == "mean":
+                    tau0 = pm.Deterministic("tau0", pt.mean(tau_mag))
+                elif sc == "fixed":
+                    if shear_target is None:
+                        raise ValueError("shear_center='fixed' requires shear_target to be set")
+                    tau0 = pm.Deterministic("tau0", pt.as_tensor_variable(float(shear_target)))
+                else:  # "learned"
+                    tau0 = pm.Normal("tau0", mu=0.5, sigma=float(shear_target_sigma))
+
+                resid = (tau_mag - tau0) / ss
+                pen = 0.5 * pt.sum(resid * resid)
+                pm.Potential("shear_const_penalty", -sw * pen)
+
+    return model, mu_const
 
 
 def Bayesian_joint_plane_selection_SMC(
@@ -404,8 +733,9 @@ def Bayesian_joint_plane_selection_SMC(
         - "R_std": float, std dev of shape ratio
         - "R_CI95": tuple, (2.5%, 97.5%) quantiles of R
         - "idata": arviz InferenceData object with full posterior
-        - "boot_principal_stresses": (B, 3) ndarray, bootstrap samples of principal stresses
-        - "boot_principal_directions": (B, 3, 3) ndarray, bootstrap samples of principal directions
+        - "posterior_principal_stresses": (B, 3) ndarray, posterior samples of principal stresses
+        - "posterior_principal_directions": (B, 3, 3) ndarray, posterior samples of principal directions
+        - "R_posterior": (B,) ndarray, posterior samples of the shape ratio R
         - "plane_probabilities": (N, 2) ndarray, [(p_plane1, p_plane2), ...] if return_plane_probabilities=True
         - "plane_selection_map": (N,) int ndarray, MAP estimate of plane selection (0=plane1, 1=plane2)
         - "friction_coefficient": float, median friction (if infer_friction=True)
@@ -608,347 +938,41 @@ def Bayesian_joint_plane_selection_SMC(
             "s_selected": s_sel,
         }
 
-    # Helper functions for PyMC model
-    def quat_to_rotation_matrix(q):
-        """Convert unit quaternion (w,x,y,z) to 3x3 rotation matrix.
-        
-        NOTE: We use pt.stacklists instead of pt.stack([[...]]) to ensure
-        the resulting matrix is contiguous, avoiding NumbaPerformanceWarning
-        when the matrix or its transpose is used in pt.dot operations.
-        """
-        w, x, y, z = q[0], q[1], q[2], q[3]
-        R11 = 1 - 2*(y*y + z*z)
-        R22 = 1 - 2*(x*x + z*z)
-        R33 = 1 - 2*(x*x + y*y)
-        R12 = 2*(x*y - z*w); R21 = 2*(x*y + z*w)
-        R13 = 2*(x*z + y*w); R31 = 2*(x*z - y*w)
-        R23 = 2*(y*z - x*w); R32 = 2*(y*z + x*w)
-        # Use stacklists for contiguous memory layout
-        return pt.stacklists([[R11, R12, R13], [R21, R22, R23], [R31, R32, R33]])
+    model, _mu_const_unused = _build_joint_model(
+        n1=n1, n2=n2, s1=s1, s2=s2,
+        q_prior_mu_arr=q_prior_mu_arr, q_prior_sigma=q_prior_sigma,
+        R_prior_mu_val=R_prior_mu_val, R_prior_sigma=R_prior_sigma,
+        infer_friction=infer_friction,
+        infer_friction_method=infer_friction_method,
+        friction_fixed=friction_fixed,
+        friction_prior_params=friction_prior_params,
+        friction_range=friction_range,
+        iterative_plane_selection=iterative_plane_selection,
+        iterative_info=iterative_info,
+        event_weights=event_weights,
+        weighted_likelihood=weighted_likelihood,
+        likelihood_weight_mode=likelihood_weight_mode,
+        tau_weight_exponent=tau_weight_exponent,
+        normalize_tau_weights=normalize_tau_weights,
+        tau_weight_clip=tau_weight_clip,
+        slip_likelihood_name=slip_likelihood_name,
+        slip_misfit_sigma=slip_misfit_sigma,
+        slip_vmf_kappa_val=slip_vmf_kappa_val,
+        instability_beta=instability_beta,
+        selection_beta=selection_beta,
+        signed_instability=signed_instability,
+        clustering_prior_strength=clustering_prior_strength,
+        plane2_prior_probs_arr=plane2_prior_probs_arr,
+        plane_prior_strength=plane_prior_strength,
+        enforce_constant_shear=enforce_constant_shear,
+        shear_weight=shear_weight,
+        shear_sigma=shear_sigma,
+        shear_center=shear_center,
+        shear_target=shear_target,
+        shear_target_sigma=shear_target_sigma,
+    )
 
-    def stress_tensor_from_R_and_shape(Rmat, Rratio):
-        """Build deviatoric stress tensor with Beaucé/Vavryčuk convention.
-
-        Uses reduced-stress parametrization consistent with ilsi.compute_instability_parameter:
-        principal stresses (tension positive):
-            sigma1 = -1, sigma2 = 2R - 1, sigma3 = +1
-
-        Sigma = Rmat @ diag([sigma1, sigma2, sigma3]) @ Rmat.T
-        
-        NOTE: We avoid pt.diag(pt.stack(...)) which creates non-contiguous arrays
-        and triggers NumbaPerformanceWarning in nutpie. Instead, we scale columns
-        directly: Rmat @ D = Rmat * diag_vals (broadcasted column-wise).
-        """
-        sig1 = -1.0
-        sig2 = 2.0 * Rratio - 1.0
-        sig3 = 1.0
-        # Scale columns of Rmat by principal stresses (equivalent to Rmat @ D)
-        # This avoids creating a non-contiguous diagonal matrix
-        diag_vals = pt.stack([sig1, sig2, sig3])  # (3,)
-        RD = Rmat * diag_vals  # Broadcasting: (3,3) * (3,) scales each column
-        return pt.dot(RD, Rmat.T)
-
-    def unit_vector(x, eps=1e-12):
-        """Normalize vector to unit length."""
-        norm = pt.sqrt(pt.sum(pt.square(x), axis=-1, keepdims=True))
-        return x / (norm + eps)
-
-    def shear_magnitude(Sigma, n):
-        """
-        Compute scalar shear stress magnitude |tau| on plane with normal n.
-        Sigma: (3, 3) stress tensor
-        n: (N, 3) normal vectors for N events
-        """
-        t = pt.dot(Sigma, n.T).T  # (N, 3)
-        tn = pt.sum(t * n, axis=-1, keepdims=True) * n  # Normal component (N, 3)
-        ts = t - tn  # Shear component (N, 3)
-        return pt.sqrt(pt.sum(pt.square(ts), axis=-1) + 1e-12)
-
-    def shear_traction_direction(Sigma, n):
-        """
-        Compute predicted shear traction direction on plane with normal n.
-        Sigma: (3, 3) stress tensor
-        n: (N, 3) normal vectors for N events
-        traction = Sigma @ n^T → (3, N) then transpose to (N, 3)
-        shear = traction - (traction·n)n  [remove normal component]
-        return unit(shear)
-        """
-        # Sigma @ n.T gives (3, N), transpose to (N, 3)
-        t = pt.dot(Sigma, n.T).T  # (N, 3)
-        tn = pt.sum(t * n, axis=-1, keepdims=True) * n  # Normal component (N, 3)
-        ts = t - tn  # Shear component (N, 3)
-        return unit_vector(ts)
-
-    def _apply_weight_clip(w, clip):
-        if clip is None:
-            return w
-        lo, hi = float(clip[0]), float(clip[1])
-        if lo <= 0.0 or hi <= 0.0 or hi < lo:
-            raise ValueError("tau_weight_clip must be (low>0, high>0, high>=low)")
-        return pt.clip(w, lo, hi)
-
-    def _tau_weights(tau1, tau2):
-        """
-        Compute (w1, w2) weights for the two-plane mixture likelihood.
-        Returned arrays have shape (N,) and are passed to the slip-direction likelihood.
-        """
-        if not weighted_likelihood:
-            return pt.ones_like(tau1), pt.ones_like(tau2)
-
-        mode = str(likelihood_weight_mode or "plane").lower()
-        p = float(tau_weight_exponent)
-        if p < 0.0:
-            raise ValueError("tau_weight_exponent must be >= 0")
-
-        if normalize_tau_weights:
-            tau_scale = pt.mean(0.5 * (tau1 + tau2)) + 1e-12
-        else:
-            tau_scale = 1.0
-
-        if mode in {"plane", "plane_specific"}:
-            w1 = (tau1 / tau_scale) ** p
-            w2 = (tau2 / tau_scale) ** p
-        elif mode in {"event", "common", "symmetric"}:
-            tau_evt = 0.5 * (tau1 + tau2)
-            w_evt = (tau_evt / tau_scale) ** p
-            w1 = w_evt
-            w2 = w_evt
-        elif mode in {"none", "off"}:
-            w1 = pt.ones_like(tau1)
-            w2 = pt.ones_like(tau2)
-        else:
-            raise ValueError("likelihood_weight_mode must be one of {'plane','event','none'}")
-
-        w1 = _apply_weight_clip(w1, tau_weight_clip)
-        w2 = _apply_weight_clip(w2, tau_weight_clip)
-        return w1, w2
-
-    # Build PyMC model
-    with pm.Model() as model:
-        # --- Stress orientation as unit quaternion ---
-        if q_prior_mu_arr is not None:
-            q_raw = pm.Normal("q_raw", mu=q_prior_mu_arr, sigma=q_prior_sigma, shape=4)
-        else:
-            q_raw = pm.Normal("q_raw", mu=0.0, sigma=1.0, shape=4)
-        # Avoid division by zero in test-value and graph build
-        q_norm = pt.sqrt(pt.sum(pt.square(q_raw))) + 1e-8
-        q = q_raw / q_norm  # Normalize to unit quaternion
-
-        Rmat = pm.Deterministic("R_matrix", quat_to_rotation_matrix(q))
-
-        # --- Shape ratio R ∈ (0,1) ---
-        if R_prior_mu_val is not None:
-            # Damped prior towards background R
-            Rratio = pm.TruncatedNormal(
-                "R", mu=R_prior_mu_val, sigma=R_prior_sigma, lower=0.001, upper=0.999
-            )
-        else:
-            Rratio = pm.Beta("R", alpha=2.0, beta=2.0)
-
-        # --- Build stress tensor ---
-        Sigma = pm.Deterministic("Sigma", stress_tensor_from_R_and_shape(Rmat, Rratio))
-
-        # --- Friction coefficient (μ) ---
-        # Default SMC behavior keeps μ fixed (to avoid the “convenient μ” feedback loop).
-        # For experiments, set infer_friction=True and infer_friction_method="sample" to
-        # jointly sample μ with stress (similar to the NUTS implementation).
-        if iterative_plane_selection:
-            mu_const = float(
-                iterative_info.get("mu", 0.5 * (friction_range[0] + friction_range[1]))
-            )
-            mu = pm.Deterministic("mu", pt.as_tensor_variable(mu_const))
-        else:
-            method = str(infer_friction_method or "posthoc").lower()
-            if infer_friction and method == "sample":
-                mu_raw = pm.Beta(
-                    "mu_raw",
-                    alpha=float(friction_prior_params[0]),
-                    beta=float(friction_prior_params[1]),
-                )
-                mu = pm.Deterministic(
-                    "mu",
-                    float(friction_range[0])
-                    + (float(friction_range[1]) - float(friction_range[0])) * mu_raw,
-                )
-            else:
-                mu_const = (
-                    float(friction_fixed)
-                    if friction_fixed is not None
-                    else 0.5 * (friction_range[0] + friction_range[1])
-                )
-                mu = pm.Deterministic("mu", pt.as_tensor_variable(mu_const))
-
-        # Optional external (stress-independent) event weights
-        if event_weights is not None:
-            w_event = pm.Data("event_weights", event_weights)
-            w_event = pt.clip(w_event, 1e-12, 1e12)
-        else:
-            w_event = 1.0
-
-        # --- Likelihood: either fixed planes (preselection) or mixture over both planes ---
-        if iterative_plane_selection:
-            # Fixed planes from preselection
-            n_selected = pm.Data("n_selected", iterative_info["n_selected"])
-            s_observed = pm.Data("s_observed", iterative_info["s_selected"])
-            # Placeholders for post-processing
-            p_plane2_post = pm.Deterministic(
-                "p_plane2_post",
-                pt.as_tensor_variable(iterative_info["plane_map"].astype(float)),
-            )
-
-            # Likelihood on the selected plane
-            s_predicted = shear_traction_direction(Sigma, n_selected)  # (N, 3)
-            tau_mag = shear_magnitude(Sigma, n_selected)  # (N,)
-            if weighted_likelihood:
-                w_tau = _tau_weights(tau_mag, tau_mag)[0]
-                loglike_per_event = _slip_direction_logp(
-                    s_observed,
-                    s_predicted,
-                    family=slip_likelihood_name,
-                    sigma=slip_misfit_sigma,
-                    vmf_kappa=slip_vmf_kappa_val,
-                    weight=w_event * w_tau,
-                )
-            else:
-                loglike_per_event = _slip_direction_logp(
-                    s_observed,
-                    s_predicted,
-                    family=slip_likelihood_name,
-                    sigma=slip_misfit_sigma,
-                    vmf_kappa=slip_vmf_kappa_val,
-                    weight=w_event,
-                )
-            pm.Potential("likelihood", pt.sum(loglike_per_event))
-        else:
-            # Marginalize nodal-plane choice (no discrete z) for SMC stability.
-            # This avoids particle degeneracy from per-event discrete indicators.
-            s_pred1 = shear_traction_direction(Sigma, n1)
-            s_pred2 = shear_traction_direction(Sigma, n2)
-
-            # Instability-based plane selection (depends on mu).
-            def instability_parameter_log(Sigma, n, mu, R, s_pred=None, s_obs=None):
-                sig1 = -1.0
-
-                denom = pt.sqrt(1.0 + mu**2)
-                tau_c = 1.0 / denom
-                sig_c = mu / denom
-
-                t = pt.dot(Sigma, n.T).T
-                sigma_n = pt.sum(t * n, axis=-1)
-
-                tn = sigma_n[:, None] * n
-                ts = t - tn
-                tau_mag = pt.sqrt(pt.sum(ts**2, axis=-1) + 1e-12)
-
-                numerator = tau_mag - mu * (sig1 - sigma_n)
-                denominator_I = tau_c - mu * (sig1 - sig_c)
-                I_val = numerator / denominator_I
-                
-                if signed_instability and s_pred is not None and s_obs is not None:
-                    # Multiply by the sign of the dot product between predicted shear and observed slip
-                    dot_product = pt.sum(s_pred * s_obs, axis=-1)
-                    I_val = I_val * pt.sign(dot_product)
-                    
-                return I_val
-
-            tau1 = shear_magnitude(Sigma, n1)
-            tau2 = shear_magnitude(Sigma, n2)
-            inst1 = instability_parameter_log(Sigma, n1, mu, Rratio, s_pred=s_pred1, s_obs=s1)
-            inst2 = instability_parameter_log(Sigma, n2, mu, Rratio, s_pred=s_pred2, s_obs=s2)
-
-            w1_tau, w2_tau = _tau_weights(tau1, tau2)
-            w1 = w_event * w1_tau
-            w2 = w_event * w2_tau
-
-            ll1 = _slip_direction_logp(
-                s1,
-                s_pred1,
-                family=slip_likelihood_name,
-                sigma=slip_misfit_sigma,
-                vmf_kappa=slip_vmf_kappa_val,
-                weight=w1,
-            )
-            ll2 = _slip_direction_logp(
-                s2,
-                s_pred2,
-                family=slip_likelihood_name,
-                sigma=slip_misfit_sigma,
-                vmf_kappa=slip_vmf_kappa_val,
-                weight=w2,
-            )
-
-            inst_delta = inst2 - inst1
-            beta_val = float(instability_beta if selection_beta is None else selection_beta)
-            beta = pt.as_tensor_variable(beta_val)
-            eps = 1e-9
-            logit_local = beta * inst_delta
-            
-            # Apply Certainty-Weighted Clustering Prior
-            if clustering_prior_strength > 0.0:
-                p_tentative = pm.math.sigmoid(logit_local)
-                certainty = pt.square(2.0 * p_tentative - 1.0)
-                
-                M1 = n1[:, :, None] * n1[:, None, :] 
-                M2 = n2[:, :, None] * n2[:, None, :]
-                
-                sum_certainty = pt.sum(certainty) + 1e-12
-                # T_conf is shape (3, 3) representing the average confident orientation
-                T_conf = pt.sum(certainty[:, None, None] * ((1.0 - p_tentative)[:, None, None] * M1 + p_tentative[:, None, None] * M2), axis=0) / sum_certainty
-                
-                E1 = pt.sum(n1 * pt.dot(T_conf, n1.T).T, axis=-1)
-                E2 = pt.sum(n2 * pt.dot(T_conf, n2.T).T, axis=-1)
-                
-                logit_local = logit_local + float(clustering_prior_strength) * (E2 - E1)
-
-            if plane2_prior_probs_arr is not None and plane_prior_strength > 0.0:
-                prior_p2 = pt.as_tensor_variable(plane2_prior_probs_arr)
-                prior_p2 = pt.clip(prior_p2, eps, 1.0 - eps)
-                prior_logit = pt.log(prior_p2) - pt.log1p(-prior_p2)
-                p2 = pm.math.sigmoid(logit_local + float(plane_prior_strength) * prior_logit)
-            else:
-                p2 = pm.math.sigmoid(logit_local)
-            p2 = pt.clip(p2, eps, 1.0 - eps)
-            p2 = pm.Deterministic("p_plane2", p2)
-
-            logw1 = pt.log1p(-p2) + ll1
-            logw2 = pt.log(p2) + ll2
-            logmix = pt.logaddexp(logw1, logw2)
-            pm.Potential("likelihood", pt.sum(logmix))
-
-            # Posterior responsibility for plane 2 per event (differentiable)
-            p_plane2_post = pm.Deterministic("p_plane2_post", pt.exp(logw2 - logmix))
-            tau_mag = (1.0 - p_plane2_post) * tau1 + p_plane2_post * tau2
-
-            # --- Optional: constant‑shear constraint ---
-            # Note: this encourages equal shear-traction magnitudes |τ| across events.
-            # Use with care: under a uniform stress tensor, |τ| generally varies with fault orientation.
-            if enforce_constant_shear:
-                sw = float(shear_weight)
-                if sw < 0.0:
-                    raise ValueError("shear_weight must be >= 0")
-                if sw > 0.0:
-                    ss = float(shear_sigma)
-                    if ss <= 0.0:
-                        raise ValueError("shear_sigma must be > 0 when enforce_constant_shear=True")
-
-                    sc = (shear_center or "mean").lower()
-                    if sc not in {"mean", "learned", "fixed"}:
-                        raise ValueError("shear_center must be one of {'mean','learned','fixed'}")
-
-                    if sc == "mean":
-                        tau0 = pm.Deterministic("tau0", pt.mean(tau_mag))  # τ̄ per draw
-                    elif sc == "fixed":
-                        if shear_target is None:
-                            raise ValueError("shear_center='fixed' requires shear_target to be set")
-                        tau0 = pm.Deterministic("tau0", pt.as_tensor_variable(float(shear_target)))
-                    else:  # sc == "learned"
-                        tau0 = pm.Normal("tau0", mu=0.5, sigma=float(shear_target_sigma))
-
-                    resid = (tau_mag - tau0) / ss
-                    pen = 0.5 * pt.sum(resid * resid)
-                    # Use a Potential carrying the full Normal log‑likelihood up to a constant
-                    pm.Potential("shear_const_penalty", -sw * pen)
-
+    with model:
         # --- SMC Sampling ---
         kernel_cls = pm.smc.kernels.IMH if kernel.upper() == "IMH" else pm.smc.kernels.MH
         idata = pm.sample_smc(
@@ -1060,9 +1084,9 @@ def Bayesian_joint_plane_selection_SMC(
         "R_std": R_std,
         "R_CI95": R_CI95,
         "idata": idata,
-        "boot_principal_stresses": boot_ps,
-        "boot_principal_directions": boot_pd,
-        "R_bootstrap": R_samples,
+        "posterior_principal_stresses": boot_ps,
+        "posterior_principal_directions": boot_pd,
+        "R_posterior": R_samples,
         "mu_samples": mu_samples,
         "tau0_samples": tau0_samples,
         "hdi": {
@@ -1430,308 +1454,55 @@ def Bayesian_joint_plane_selection_NUTS(
             "s_selected": s_sel,
         }
 
-    mu_const: Optional[float] = None
+    model, mu_const = _build_joint_model(
+        n1=n1, n2=n2, s1=s1, s2=s2,
+        q_prior_mu_arr=q_prior_mu_arr, q_prior_sigma=q_prior_sigma,
+        R_prior_mu_val=R_prior_mu_val, R_prior_sigma=R_prior_sigma,
+        infer_friction=infer_friction,
+        infer_friction_method=infer_friction_method,
+        friction_fixed=friction_fixed,
+        friction_prior_params=friction_prior_params,
+        friction_range=friction_range,
+        iterative_plane_selection=iterative_plane_selection,
+        iterative_info=iterative_info,
+        event_weights=event_weights,
+        weighted_likelihood=weighted_likelihood,
+        likelihood_weight_mode=likelihood_weight_mode,
+        tau_weight_exponent=tau_weight_exponent,
+        normalize_tau_weights=normalize_tau_weights,
+        tau_weight_clip=tau_weight_clip,
+        slip_likelihood_name=slip_likelihood_name,
+        slip_misfit_sigma=slip_misfit_sigma,
+        slip_vmf_kappa_val=slip_vmf_kappa_val,
+        instability_beta=instability_beta,
+        selection_beta=selection_beta,
+        signed_instability=signed_instability,
+        clustering_prior_strength=clustering_prior_strength,
+        plane2_prior_probs_arr=plane2_prior_probs_arr,
+        plane_prior_strength=plane_prior_strength,
+        enforce_constant_shear=enforce_constant_shear,
+        shear_weight=shear_weight,
+        shear_sigma=shear_sigma,
+        shear_center=shear_center,
+        shear_target=shear_target,
+        shear_target_sigma=shear_target_sigma,
+    )
 
-    # Helper functions (duplicated from SMC implementation to keep this self-contained)
-    def quat_to_rotation_matrix(q):
-        # Use pt.stacklists for contiguous memory layout (avoids NumbaPerformanceWarning)
-        w, x, y, z = q[0], q[1], q[2], q[3]
-        R11 = 1 - 2 * (y * y + z * z)
-        R22 = 1 - 2 * (x * x + z * z)
-        R33 = 1 - 2 * (x * x + y * y)
-        R12 = 2 * (x * y - z * w)
-        R21 = 2 * (x * y + z * w)
-        R13 = 2 * (x * z + y * w)
-        R31 = 2 * (x * z - y * w)
-        R23 = 2 * (y * z - x * w)
-        R32 = 2 * (y * z + x * w)
-        return pt.stacklists([[R11, R12, R13], [R21, R22, R23], [R31, R32, R33]])
+    sampler_kwargs: Dict[str, Any] = {
+        "draws": draws,
+        "tune": tune,
+        "chains": chains,
+        "cores": cores,
+        "target_accept": target_accept,
+        "random_seed": random_seed,
+        "progressbar": progressbar,
+        "return_inferencedata": True,
+    }
 
-    def stress_tensor_from_R_and_shape(Rmat, Rratio):
-        # Scale columns of Rmat by principal stresses (equivalent to Rmat @ diag)
-        # Avoids non-contiguous diagonal matrix from pt.stack that triggers
-        # NumbaPerformanceWarning in nutpie.
-        sig1 = -1.0
-        sig2 = 2.0 * Rratio - 1.0
-        sig3 = 1.0
-        diag_vals = pt.stack([sig1, sig2, sig3])
-        RD = Rmat * diag_vals  # (3,3) * (3,) - column-wise scaling
-        return pt.dot(RD, Rmat.T)
-
-    def unit_vector(x, eps=1e-12):
-        norm = pt.sqrt(pt.sum(pt.square(x), axis=-1, keepdims=True))
-        return x / (norm + eps)
-
-    def shear_traction_direction(Sigma, n):
-        t = pt.dot(Sigma, n.T).T  # (N, 3)
-        tn = pt.sum(t * n, axis=-1, keepdims=True) * n
-        ts = t - tn
-        return unit_vector(ts)
-
-    def shear_magnitude(Sigma, n):
-        t_full = pt.dot(Sigma, n.T).T
-        tn_comp = pt.sum(t_full * n, axis=-1, keepdims=True) * n
-        ts_comp = t_full - tn_comp
-        return pt.sqrt(pt.sum(pt.square(ts_comp), axis=-1) + 1e-12)
-
-    def _apply_weight_clip(w, clip):
-        if clip is None:
-            return w
-        lo, hi = float(clip[0]), float(clip[1])
-        if lo <= 0.0 or hi <= 0.0 or hi < lo:
-            raise ValueError("tau_weight_clip must be (low>0, high>0, high>=low)")
-        return pt.clip(w, lo, hi)
-
-    def _tau_weights(tau1, tau2):
-        if not weighted_likelihood:
-            return pt.ones_like(tau1), pt.ones_like(tau2)
-
-        mode = str(likelihood_weight_mode or "plane").lower()
-        p = float(tau_weight_exponent)
-        if p < 0.0:
-            raise ValueError("tau_weight_exponent must be >= 0")
-
-        if normalize_tau_weights:
-            tau_scale = pt.mean(0.5 * (tau1 + tau2)) + 1e-12
-        else:
-            tau_scale = 1.0
-
-        if mode in {"plane", "plane_specific"}:
-            w1 = (tau1 / tau_scale) ** p
-            w2 = (tau2 / tau_scale) ** p
-        elif mode in {"event", "common", "symmetric"}:
-            tau_evt = 0.5 * (tau1 + tau2)
-            w_evt = (tau_evt / tau_scale) ** p
-            w1 = w_evt
-            w2 = w_evt
-        elif mode in {"none", "off"}:
-            w1 = pt.ones_like(tau1)
-            w2 = pt.ones_like(tau2)
-        else:
-            raise ValueError("likelihood_weight_mode must be one of {'plane','event','none'}")
-
-        w1 = _apply_weight_clip(w1, tau_weight_clip)
-        w2 = _apply_weight_clip(w2, tau_weight_clip)
-        return w1, w2
-
-    # Build PyMC model
-    with pm.Model() as model:
-        # --- Stress orientation as unit quaternion ---
-        if q_prior_mu_arr is not None:
-            q_raw = pm.Normal("q_raw", mu=q_prior_mu_arr, sigma=q_prior_sigma, shape=4)
-        else:
-            q_raw = pm.Normal("q_raw", mu=0.0, sigma=1.0, shape=4)
-        q_norm = pt.sqrt(pt.sum(pt.square(q_raw))) + 1e-8
-        q = q_raw / q_norm
-        Rmat = pm.Deterministic("R_matrix", quat_to_rotation_matrix(q))
-
-        # --- Shape ratio R ∈ (0,1) ---
-        if R_prior_mu_val is not None:
-            # Damped prior towards background R
-            Rratio = pm.TruncatedNormal(
-                "R", mu=R_prior_mu_val, sigma=R_prior_sigma, lower=0.001, upper=0.999
-            )
-        else:
-            Rratio = pm.Beta("R", alpha=2.0, beta=2.0)
-        Sigma = pm.Deterministic("Sigma", stress_tensor_from_R_and_shape(Rmat, Rratio))
-
-        # --- Optional: Friction coefficient (fixed in iterative mode) ---
-        method = str(infer_friction_method or "sample").lower()
-        if infer_friction and not iterative_plane_selection and method == "sample":
-            mu_raw = pm.Beta("mu_raw", alpha=friction_prior_params[0], beta=friction_prior_params[1])
-            mu = pm.Deterministic(
-                "mu", friction_range[0] + (friction_range[1] - friction_range[0]) * mu_raw
-            )
-        else:
-            if iterative_plane_selection:
-                mu_const = float(iterative_info.get("mu", 0.5 * (friction_range[0] + friction_range[1])))
-            else:
-                mu_const = (
-                    float(friction_fixed)
-                    if friction_fixed is not None
-                    else 0.5 * (friction_range[0] + friction_range[1])
-                )
-            mu = pm.Deterministic("mu", pt.as_tensor_variable(mu_const))
-
-        if event_weights is not None:
-            w_event = pm.Data("event_weights", event_weights)
-            w_event = pt.clip(w_event, 1e-12, 1e12)
-        else:
-            w_event = 1.0
-        # --- Likelihood: either fixed planes (preselection) or mixture over both planes ---
-        p_plane2_post = None
-        if iterative_plane_selection:
-            n_selected = pm.Data("n_selected", iterative_info["n_selected"])
-            s_observed = pm.Data("s_observed", iterative_info["s_selected"])
-            s_pred = shear_traction_direction(Sigma, n_selected)
-            tau_mag = shear_magnitude(Sigma, n_selected)
-            if weighted_likelihood:
-                w_tau = _tau_weights(tau_mag, tau_mag)[0]
-                ll = _slip_direction_logp(
-                    s_observed,
-                    s_pred,
-                    family=slip_likelihood_name,
-                    sigma=slip_misfit_sigma,
-                    vmf_kappa=slip_vmf_kappa_val,
-                    weight=w_event * w_tau,
-                )
-            else:
-                ll = _slip_direction_logp(
-                    s_observed,
-                    s_pred,
-                    family=slip_likelihood_name,
-                    sigma=slip_misfit_sigma,
-                    vmf_kappa=slip_vmf_kappa_val,
-                    weight=w_event,
-                )
-            pm.Potential("likelihood", pt.sum(ll))
-            # Fix scoper for post-processing
-            p_plane2_post = pm.Deterministic("p_plane2_post", pt.as_tensor_variable(iterative_info["plane_map"].astype(float)))
-        else:
-            s_pred1 = shear_traction_direction(Sigma, n1)
-            s_pred2 = shear_traction_direction(Sigma, n2)
-
-            eps = 1e-9
-            # Instability-based plane selection (depends on mu).
-            def instability_parameter_log(Sigma, n, mu, R, s_pred=None, s_obs=None):
-                sig1 = -1.0
-                # sig2 = 2.0 * R - 1.0  # Not used explicitly in formula but defines the tensor
-                # sig3 = 1.0
-                
-                denom = pt.sqrt(1.0 + mu**2)
-                tau_c = 1.0 / denom
-                sig_c = mu / denom
-                
-                t = pt.dot(Sigma, n.T).T
-                sigma_n = pt.sum(t * n, axis=-1)
-                
-                tn = sigma_n[:, None] * n
-                ts = t - tn
-                tau_mag = pt.sqrt(pt.sum(ts**2, axis=-1) + 1e-12)
-
-                numerator = tau_mag - mu * (sig1 - sigma_n)
-                denominator_I = tau_c - mu * (sig1 - sig_c)
-                I_val = numerator / denominator_I
-                
-                if signed_instability and s_pred is not None and s_obs is not None:
-                    # Multiply by the sign of the dot product between predicted shear and observed slip
-                    dot_product = pt.sum(s_pred * s_obs, axis=-1)
-                    I_val = I_val * pt.sign(dot_product)
-                    
-                return I_val
-
-            tau1 = shear_magnitude(Sigma, n1)
-            tau2 = shear_magnitude(Sigma, n2)
-            inst1 = instability_parameter_log(Sigma, n1, mu, Rratio, s_pred=s_pred1, s_obs=s1)
-            inst2 = instability_parameter_log(Sigma, n2, mu, Rratio, s_pred=s_pred2, s_obs=s2)
-
-            w1_tau, w2_tau = _tau_weights(tau1, tau2)
-            w1 = w_event * w1_tau
-            w2 = w_event * w2_tau
-
-            ll1 = _slip_direction_logp(
-                s1,
-                s_pred1,
-                family=slip_likelihood_name,
-                sigma=slip_misfit_sigma,
-                vmf_kappa=slip_vmf_kappa_val,
-                weight=w1,
-            )
-            ll2 = _slip_direction_logp(
-                s2,
-                s_pred2,
-                family=slip_likelihood_name,
-                sigma=slip_misfit_sigma,
-                vmf_kappa=slip_vmf_kappa_val,
-                weight=w2,
-            )
-
-            inst_delta = (inst2 - inst1)
-            beta_val = float(instability_beta if selection_beta is None else selection_beta)
-            beta = pt.as_tensor_variable(beta_val)
-            logit_local = beta * inst_delta
-            
-            # Apply Certainty-Weighted Clustering Prior
-            if clustering_prior_strength > 0.0:
-                p_tentative = pm.math.sigmoid(logit_local)
-                certainty = pt.square(2.0 * p_tentative - 1.0)
-                
-                M1 = n1[:, :, None] * n1[:, None, :] 
-                M2 = n2[:, :, None] * n2[:, None, :]
-                
-                sum_certainty = pt.sum(certainty) + 1e-12
-                # T_conf is shape (3, 3) representing the average confident orientation
-                T_conf = pt.sum(certainty[:, None, None] * ((1.0 - p_tentative)[:, None, None] * M1 + p_tentative[:, None, None] * M2), axis=0) / sum_certainty
-                
-                E1 = pt.sum(n1 * pt.dot(T_conf, n1.T).T, axis=-1)
-                E2 = pt.sum(n2 * pt.dot(T_conf, n2.T).T, axis=-1)
-                
-                logit_local = logit_local + float(clustering_prior_strength) * (E2 - E1)
-
-            if plane2_prior_probs_arr is not None and plane_prior_strength > 0.0:
-                prior_p2 = pt.as_tensor_variable(plane2_prior_probs_arr)
-                prior_p2 = pt.clip(prior_p2, eps, 1.0 - eps)
-                prior_logit = pt.log(prior_p2) - pt.log1p(-prior_p2)
-                p2 = pm.math.sigmoid(logit_local + float(plane_prior_strength) * prior_logit)
-            else:
-                p2 = pm.math.sigmoid(logit_local)
-            p2 = pt.clip(p2, eps, 1.0 - eps)
-            p2 = pm.Deterministic("p_plane2", p2)
-            logw1 = pt.log1p(-p2) + ll1
-            logw2 = pt.log(p2) + ll2
-            logmix = pt.logaddexp(logw1, logw2)
-            pm.Potential("likelihood", pt.sum(logmix))
-
-            # Posterior responsibility for plane 2 per event (differentiable)
-            p_plane2_post = pm.Deterministic("p_plane2_post", pt.exp(logw2 - logmix))
-
-            # Shear magnitudes on each plane; blend by posterior responsibility
-            tau1 = shear_magnitude(Sigma, n1)
-            tau2 = shear_magnitude(Sigma, n2)
-            tau_mag = (1.0 - p_plane2_post) * tau1 + p_plane2_post * tau2
-        # --- Optional: constant‑shear constraint ---
-        # Note: this encourages equal shear-traction magnitudes |τ| across events.
-        # Use with care: under a uniform stress tensor, |τ| generally varies with fault orientation.
-        if enforce_constant_shear:
-            sw = float(shear_weight)
-            if sw < 0.0:
-                raise ValueError("shear_weight must be >= 0")
-            if sw > 0.0:
-                ss = float(shear_sigma)
-                if ss <= 0.0:
-                    raise ValueError("shear_sigma must be > 0 when enforce_constant_shear=True")
-
-                sc = (shear_center or "mean").lower()
-                if sc not in {"mean", "learned", "fixed"}:
-                    raise ValueError("shear_center must be one of {'mean','learned','fixed'}")
-
-                if sc == "mean":
-                    tau0 = pm.Deterministic("tau0", pt.mean(tau_mag))
-                elif sc == "fixed":
-                    if shear_target is None:
-                        raise ValueError("shear_center='fixed' requires shear_target to be set")
-                    tau0 = pm.Deterministic("tau0", pt.as_tensor_variable(float(shear_target)))
-                else:
-                    tau0 = pm.Normal("tau0", mu=0.5, sigma=float(shear_target_sigma))
-
-                resid = (tau_mag - tau0) / ss
-                pen = 0.5 * pt.sum(resid * resid)
-                pm.Potential("shear_const_penalty", -sw * pen)
-
-        sampler_kwargs: Dict[str, Any] = {
-            "draws": draws,
-            "tune": tune,
-            "chains": chains,
-            "cores": cores,
-            "target_accept": target_accept,
-            "random_seed": random_seed,
-            "progressbar": progressbar,
-            "return_inferencedata": True,
-        }
-
-        # Optional: choose an explicit NUTS backend (e.g., nutpie)
-        nk = {} if nuts_sampler_kwargs is None else dict(nuts_sampler_kwargs)
-        sampler_name = (nuts_sampler or "").lower()
+    # Optional: choose an explicit NUTS backend (e.g., nutpie)
+    nk = {} if nuts_sampler_kwargs is None else dict(nuts_sampler_kwargs)
+    sampler_name = (nuts_sampler or "").lower()
+    with model:
         if sampler_name in {"nutpie", "nuts-nutpie"}:
             idata = pm.sample(nuts_sampler="nutpie", nuts_sampler_kwargs=nk, **sampler_kwargs)
         elif sampler_name in {"numpyro", "jax"}:
@@ -1819,9 +1590,9 @@ def Bayesian_joint_plane_selection_NUTS(
         "R_std": R_std,
         "R_CI95": R_CI95,
         "idata": idata,
-        "boot_principal_stresses": boot_ps,
-        "boot_principal_directions": boot_pd,
-        "R_bootstrap": R_samples,
+        "posterior_principal_stresses": boot_ps,
+        "posterior_principal_directions": boot_pd,
+        "R_posterior": R_samples,
         "mu_samples": mu_samples,
         "tau0_samples": tau0_samples,
     }
