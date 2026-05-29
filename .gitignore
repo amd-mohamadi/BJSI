@@ -1,0 +1,4 @@
+*.log
+*.pyc
+cushing_test/
+CLAUDE.md
