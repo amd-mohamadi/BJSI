@@ -17,6 +17,8 @@ Author: ILSI Development Team
 Date: 2025-10-24
 """
 
+import warnings
+
 import numpy as np
 import arviz as az
 import pymc as pm
@@ -171,8 +173,12 @@ def _slip_direction_logp(
     if family == "gaussian":
         diff = s_obs_unit - s_pred_unit
         sigma2 = float(sigma) ** 2
-        return -0.5 * safe_weight * pt.sum(diff**2, axis=-1) / sigma2 - 1.5 * np.log(
-            2 * np.pi * sigma2
+        # Precision-weighted Gaussian: the weight scales the precision, so the
+        # normalizer must carry it too (sigma2 / weight), otherwise the term is
+        # not a density in s_obs for every stress state and the sampler is
+        # rewarded for changing the stress to change the weights.
+        return -0.5 * safe_weight * pt.sum(diff**2, axis=-1) / sigma2 - 1.5 * pt.log(
+            2 * np.pi * (sigma2 / safe_weight)
         )
 
     if family != "von_mises_fisher":
@@ -180,11 +186,12 @@ def _slip_direction_logp(
     if vmf_kappa is None:
         raise ValueError("vmf_kappa must be provided for the von_mises_fisher likelihood")
 
-    kappa_base = float(vmf_kappa)
-    kappa_eff = safe_weight * kappa_base
+    # The weight scales the concentration; the vMF normalizer C3(kappa_eff)
+    # must use the same effective concentration (see Gaussian branch above).
+    kappa_eff = safe_weight * float(vmf_kappa)
     dot = pt.clip(pt.sum(s_obs_unit * s_pred_unit, axis=-1), -1.0, 1.0)
-    log_sinh_kappa = kappa_base + np.log(-np.expm1(-2.0 * kappa_base)) - np.log(2.0)
-    log_c3 = np.log(kappa_base) - np.log(4.0 * np.pi) - log_sinh_kappa
+    log_sinh_kappa = kappa_eff + pt.log(-pt.expm1(-2.0 * kappa_eff)) - np.log(2.0)
+    log_c3 = pt.log(kappa_eff) - np.log(4.0 * np.pi) - log_sinh_kappa
     return log_c3 + kappa_eff * dot
 
 
@@ -278,10 +285,24 @@ def _build_joint_model(
         if not weighted_likelihood:
             return pt.ones_like(tau1), pt.ones_like(tau2)
 
-        mode = str(likelihood_weight_mode or "plane").lower()
+        mode = str(likelihood_weight_mode or "event").lower()
         p = float(tau_weight_exponent)
         if p < 0.0:
             raise ValueError("tau_weight_exponent must be >= 0")
+        if mode in {"plane", "plane_specific"}:
+            # EXPERIMENTAL. Because the along-slip shear component is identical
+            # on both nodal planes, cos(misfit_k) = c / tau_k, so a per-plane
+            # weight tau_k**p multiplies the plane likelihood by tau_k**(p-1):
+            # p < 1 favours the lower-shear plane, p == 1 makes the likelihood
+            # blind to the plane, p > 1 favours the higher-shear plane. This
+            # couples the weighting to plane selection and can bias R.
+            warnings.warn(
+                "likelihood_weight_mode='plane' is experimental: per-plane shear "
+                "weights couple to nodal-plane selection and can bias R. "
+                "Use likelihood_weight_mode='event'.",
+                UserWarning,
+                stacklevel=3,
+            )
 
         if normalize_tau_weights:
             tau_scale = pt.mean(0.5 * (tau1 + tau2)) + 1e-12
@@ -574,7 +595,10 @@ def Bayesian_joint_plane_selection_SMC(
     shear_center: str = "mean",
     shear_weight: float = 0.1,
     weighted_likelihood: bool = False,
-    likelihood_weight_mode: str = "plane",
+    # "event": both nodal planes of an event share one weight from their mean
+    # shear traction (recommended). "plane": per-plane weights (EXPERIMENTAL,
+    # couples the weight to nodal-plane selection; see _tau_weights).
+    likelihood_weight_mode: str = "event",
     tau_weight_exponent: float = 2.0,
     normalize_tau_weights: bool = False,
     tau_weight_clip: Optional[Tuple[float, float]] = None,
@@ -1286,7 +1310,10 @@ def Bayesian_joint_plane_selection_NUTS(
     shear_center: str = "mean",
     shear_weight: float = 0.1,
     weighted_likelihood: bool = False,
-    likelihood_weight_mode: str = "plane",
+    # "event": both nodal planes of an event share one weight from their mean
+    # shear traction (recommended). "plane": per-plane weights (EXPERIMENTAL,
+    # couples the weight to nodal-plane selection; see _tau_weights).
+    likelihood_weight_mode: str = "event",
     tau_weight_exponent: float = 2.0,
     normalize_tau_weights: bool = False,
     tau_weight_clip: Optional[Tuple[float, float]] = None,
