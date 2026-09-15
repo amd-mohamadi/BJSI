@@ -26,6 +26,11 @@ import pytensor.tensor as pt
 import pytensor.gradient as ptg
 from typing import Optional, Tuple, Dict, Any
 
+try:
+    from .mechanism_uncertainty import prepare_mechanism_errors, validate_fixed_planes, latent_mechanism_vectors
+except ImportError:
+    from mechanism_uncertainty import prepare_mechanism_errors, validate_fixed_planes, latent_mechanism_vectors
+
 # Optional import of deterministic routines
 try:
     from . import ilsi as _det
@@ -232,6 +237,9 @@ def _build_joint_model(
     shear_center: str,
     shear_target: Optional[float],
     shear_target_sigma: float,
+    mechanism_angles=None,
+    mechanism_errors=None,
+    fixed_plane_indices=None,
 ) -> Tuple["pm.Model", Optional[float]]:
     """Build the joint PyMC model shared by the SMC and NUTS entry points.
 
@@ -330,6 +338,10 @@ def _build_joint_model(
     mu_const: Optional[float] = None
 
     with pm.Model() as model:
+        if mechanism_angles is not None:
+            n1, s1, n2, s2 = latent_mechanism_vectors(
+                mechanism_angles, mechanism_errors, n1, s1, n2, s2,
+            )
         # --- Stress orientation as unit quaternion ---
         if q_prior_mu_arr is not None:
             q_raw = pm.Normal("q_raw", mu=q_prior_mu_arr, sigma=q_prior_sigma, shape=4)
@@ -385,8 +397,13 @@ def _build_joint_model(
 
         # --- Likelihood: either fixed planes (preselection) or plane mixture ---
         if iterative_plane_selection:
-            n_selected = pm.Data("n_selected", iterative_info["n_selected"])
-            s_observed = pm.Data("s_observed", iterative_info["s_selected"])
+            if mechanism_errors is not None and np.any(mechanism_errors > 0):
+                mask = iterative_info["plane_map"][:, None].astype(bool)
+                n_selected = pt.where(mask, n2, n1)
+                s_observed = pt.where(mask, s2, s1)
+            else:
+                n_selected = pm.Data("n_selected", iterative_info["n_selected"])
+                s_observed = pm.Data("s_observed", iterative_info["s_selected"])
             pm.Deterministic(
                 "p_plane2_post",
                 pt.as_tensor_variable(iterative_info["plane_map"].astype(float)),
@@ -411,6 +428,22 @@ def _build_joint_model(
                     vmf_kappa=slip_vmf_kappa_val,
                     weight=w_event,
                 )
+            pm.Potential("likelihood", pt.sum(loglike_per_event))
+        elif fixed_plane_indices is not None:
+            mask = fixed_plane_indices[:, None].astype(bool)
+            n_selected = pt.where(mask, n2, n1)
+            s_observed = pt.where(mask, s2, s1)
+            pm.Deterministic("p_plane2_post", pt.as_tensor_variable(fixed_plane_indices.astype(float)))
+            s_predicted = shear_traction_direction(Sigma, n_selected)
+            tau_mag = shear_magnitude(Sigma, n_selected)
+            # Preserve event-mode weighting from the joint likelihood: the
+            # same two-plane mean shear, even when the fault label is fixed.
+            w1_tau, w2_tau = _tau_weights(shear_magnitude(Sigma, n1), shear_magnitude(Sigma, n2))
+            weight = w_event * pt.where(fixed_plane_indices.astype(bool), w2_tau, w1_tau)
+            loglike_per_event = _slip_direction_logp(
+                s_observed, s_predicted, family=slip_likelihood_name,
+                sigma=slip_misfit_sigma, vmf_kappa=slip_vmf_kappa_val, weight=weight,
+            )
             pm.Potential("likelihood", pt.sum(loglike_per_event))
         else:
             s_pred1 = shear_traction_direction(Sigma, n1)
@@ -611,9 +644,27 @@ def Bayesian_joint_plane_selection_SMC(
     plane2_prior_probs: Optional[np.ndarray] = None,
     plane_prior_strength: float = 0.0,
     clustering_prior_strength: float = 0.0,
+    strike_sigma_deg=5.0,
+    dip_sigma_deg=5.0,
+    rake_sigma_deg=5.0,
+    fixed_plane_indices: Optional[np.ndarray] = None,
 ) -> Dict[str, Any]:
     """
     Joint Bayesian inference of stress orientation, shape ratio, and nodal plane selection using SMC.
+
+    Measurement uncertainty: strike_sigma_deg, dip_sigma_deg, rake_sigma_deg
+    are independent one-sigma local errors in degrees for the FIRST supplied
+    nodal plane. Each accepts a scalar (default 5 degrees) or an (N,) array.
+    Both nodal planes share one latent mechanism. Set all three to zero to
+    reproduce the exact-angle legacy model. The directional likelihood still
+    describes residual model scatter; these errors additionally describe SDR
+    measurement uncertainty. Posterior canonical plane-1 angles are stored in
+    idata.posterior["mechanism_angles_deg"] when any error is nonzero.
+
+    fixed_plane_indices optionally fixes all fault labels externally (0/1 for
+    input plane 1/2). This bypasses instability and clustering for selection,
+    without fixing the uncertain geometry. It cannot be combined with iterative
+    preselection. Friction is not identifiable from the fixed-plane likelihood.
 
     This function implements the Sequential Monte Carlo approach described in SMC.md, which jointly
     infers stress parameters and selects the fault plane for each focal mechanism in a single
@@ -848,6 +899,11 @@ def Bayesian_joint_plane_selection_SMC(
     if not (len(dips_1) == len(rakes_1) == len(strikes_2) == len(dips_2) == len(rakes_2) == N):
         raise ValueError("All input arrays must have the same length")
 
+    mechanism_angles, mechanism_errors = prepare_mechanism_errors(
+        strikes_1, dips_1, rakes_1, strike_sigma_deg, dip_sigma_deg, rake_sigma_deg,
+    )
+    fixed_plane_indices = validate_fixed_planes(fixed_plane_indices, N, iterative_plane_selection)
+
     # Convert focal mechanisms to normal and slip unit vectors
     n1, s1 = normal_slip_vectors_batch(strikes_1, dips_1, rakes_1, direction="inward")
     n2, s2 = normal_slip_vectors_batch(strikes_2, dips_2, rakes_2, direction="inward")
@@ -964,6 +1020,8 @@ def Bayesian_joint_plane_selection_SMC(
 
     model, _mu_const_unused = _build_joint_model(
         n1=n1, n2=n2, s1=s1, s2=s2,
+        mechanism_angles=mechanism_angles, mechanism_errors=mechanism_errors,
+        fixed_plane_indices=fixed_plane_indices,
         q_prior_mu_arr=q_prior_mu_arr, q_prior_sigma=q_prior_sigma,
         R_prior_mu_val=R_prior_mu_val, R_prior_sigma=R_prior_sigma,
         infer_friction=infer_friction,
@@ -1131,6 +1189,9 @@ def Bayesian_joint_plane_selection_SMC(
             "mu": mu_hdi,
             "tau0": tau0_hdi,
         }
+
+    results["mechanism_sigma_deg"] = mechanism_errors.copy()
+    results["fixed_plane_indices"] = None if fixed_plane_indices is None else fixed_plane_indices.copy()
 
     # Plane selection probabilities and MAP estimates
     if return_plane_probabilities:
@@ -1326,9 +1387,28 @@ def Bayesian_joint_plane_selection_NUTS(
     plane2_prior_probs: Optional[np.ndarray] = None,
     plane_prior_strength: float = 0.0,
     clustering_prior_strength: float = 0.0,
+    strike_sigma_deg=5.0,
+    dip_sigma_deg=5.0,
+    rake_sigma_deg=5.0,
+    fixed_plane_indices: Optional[np.ndarray] = None,
+    initvals=None,
 ) -> Dict[str, Any]:
     """
     Joint Bayesian inference of stress orientation, shape ratio, and nodal plane selection using NUTS.
+
+    Measurement uncertainty: strike_sigma_deg, dip_sigma_deg, rake_sigma_deg
+    are independent one-sigma local errors in degrees for the FIRST supplied
+    nodal plane. Each accepts a scalar (default 5 degrees) or an (N,) array.
+    Both nodal planes share one latent mechanism. Set all three to zero to
+    reproduce the exact-angle legacy model. The directional likelihood still
+    describes residual model scatter; these errors additionally describe SDR
+    measurement uncertainty. Posterior canonical plane-1 angles are stored in
+    idata.posterior["mechanism_angles_deg"] when any error is nonzero.
+
+    fixed_plane_indices optionally fixes all fault labels externally (0/1 for
+    input plane 1/2). This bypasses instability and clustering for selection,
+    without fixing the uncertain geometry. It cannot be combined with iterative
+    preselection. Friction is not identifiable from the fixed-plane likelihood.
 
     NUTS cannot sample discrete plane indicators z_i directly. This implementation uses a
     differentiable marginalization: each event likelihood is a 2-component mixture over the two
@@ -1362,6 +1442,11 @@ def Bayesian_joint_plane_selection_NUTS(
         len(dips_1) == len(rakes_1) == len(strikes_2) == len(dips_2) == len(rakes_2) == N
     ):
         raise ValueError("All input arrays must have the same length")
+
+    mechanism_angles, mechanism_errors = prepare_mechanism_errors(
+        strikes_1, dips_1, rakes_1, strike_sigma_deg, dip_sigma_deg, rake_sigma_deg,
+    )
+    fixed_plane_indices = validate_fixed_planes(fixed_plane_indices, N, iterative_plane_selection)
 
     # Convert focal mechanisms to normal and slip unit vectors
     n1, s1 = normal_slip_vectors_batch(strikes_1, dips_1, rakes_1, direction="inward")
@@ -1483,6 +1568,8 @@ def Bayesian_joint_plane_selection_NUTS(
 
     model, mu_const = _build_joint_model(
         n1=n1, n2=n2, s1=s1, s2=s2,
+        mechanism_angles=mechanism_angles, mechanism_errors=mechanism_errors,
+        fixed_plane_indices=fixed_plane_indices,
         q_prior_mu_arr=q_prior_mu_arr, q_prior_sigma=q_prior_sigma,
         R_prior_mu_val=R_prior_mu_val, R_prior_sigma=R_prior_sigma,
         infer_friction=infer_friction,
@@ -1529,6 +1616,11 @@ def Bayesian_joint_plane_selection_NUTS(
     # Optional: choose an explicit NUTS backend (e.g., nutpie)
     nk = {} if nuts_sampler_kwargs is None else dict(nuts_sampler_kwargs)
     sampler_name = (nuts_sampler or "").lower()
+    if initvals is not None:
+        if sampler_name not in {"", "pymc"}:
+            raise ValueError("Explicit initvals require the PyMC NUTS backend (nuts_sampler='pymc')")
+        sampler_kwargs["initvals"] = initvals
+        sampler_kwargs["init"] = "adapt_diag"
     with model:
         if sampler_name in {"nutpie", "nuts-nutpie"}:
             idata = pm.sample(nuts_sampler="nutpie", nuts_sampler_kwargs=nk, **sampler_kwargs)
@@ -1634,6 +1726,9 @@ def Bayesian_joint_plane_selection_NUTS(
     results["hdi"] = hdi_info
     if abs(float(hdi_prob) - 0.9) < 1e-6:
         results["hdi_90"] = hdi_info
+
+    results["mechanism_sigma_deg"] = mechanism_errors.copy()
+    results["fixed_plane_indices"] = None if fixed_plane_indices is None else fixed_plane_indices.copy()
 
     if return_plane_probabilities:
         if iterative_plane_selection:

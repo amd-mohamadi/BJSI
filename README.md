@@ -70,6 +70,52 @@ The script writes results under `Geysers_output/`:
 - `arviz.summary.txt`, `arviz.ess_rhat.csv`, `arviz.plot_posterior_hdi90.png`: posterior diagnostics
 - `figures/`: Mohr/stereonet/PT/map figures
 
+## Mechanism uncertainty and externally fixed fault planes
+
+The PyMC NUTS and SMC entry points accept `strike_sigma_deg`, `dip_sigma_deg`,
+and `rake_sigma_deg`. Each is a one-standard-deviation measurement error in
+degrees, supplied either globally as a scalar or separately for each event as
+an array of length N. **All three now default to 5 degrees.** Explicitly set all
+three to zero to reproduce the previous exact-angle model.
+
+The model draws one latent mechanism per event using independent local Gaussian
+offsets from the first supplied nodal plane's strike, dip, and rake. It derives
+the auxiliary plane from that same mechanism, preserving the double couple.
+Angle wrapping and dip-boundary crossings are handled through the normal/slip
+vectors. This is a local SDR error model, not a rotation-invariant distribution;
+the 5-degree default is an assumption to test against actual catalog errors.
+The directional likelihood retains its existing residual-scatter parameter.
+
+To condition stress inference on externally supplied fault labels:
+
+```python
+result = Bayesian_joint_plane_selection_NUTS(
+    strike1, dip1, rake1, strike2, dip2, rake2,
+    fixed_plane_indices=labels_1_or_2 - 1,
+    strike_sigma_deg=5.0, dip_sigma_deg=5.0, rake_sigma_deg=5.0,
+    infer_friction=False, friction_fixed=0.6,
+    weighted_likelihood=False, clustering_prior_strength=0.0,
+    slip_likelihood="von_mises_fisher", slip_vmf_kappa=8.0,
+)
+```
+
+`fixed_plane_indices` must contain 0 for input plane 1 or 1 for input plane 2
+for every event. It bypasses instability and clustering in plane selection,
+while still allowing uncertain geometry. It cannot be combined with iterative
+preselection. Friction does not enter this directional likelihood; the fixed
+value above is only an output placeholder, not an inferred friction estimate.
+With fixed labels, reported plane probabilities are exactly zero or one and
+agreement with those labels is imposed, not a validation result.
+
+The result records `mechanism_sigma_deg` (N by 3) and `fixed_plane_indices`.
+With nonzero errors, `result['idata'].posterior['mechanism_angles_deg']` contains
+canonical latent plane-1 strike/dip/rake draws. Use these draws for analyses of
+the inferred geometry; existing plotting helpers use nominal input geometry.
+The separate BlackJAX implementation does not yet support these arguments.
+
+For controlled starting-point tests, NUTS accepts `initvals` with the native
+`nuts_sampler='pymc'` backend and uses `adapt_diag` without start-point jitter.
+
 
 ## References
 - Michael (1984), stress inversion from slip data.
