@@ -28,8 +28,10 @@ from typing import Optional, Tuple, Dict, Any
 
 try:
     from .mechanism_uncertainty import prepare_mechanism_errors, validate_fixed_planes, latent_mechanism_vectors
+    from . import fault_population as _fp
 except ImportError:
     from mechanism_uncertainty import prepare_mechanism_errors, validate_fixed_planes, latent_mechanism_vectors
+    import fault_population as _fp
 
 # Optional import of deterministic routines
 try:
@@ -191,13 +193,21 @@ def _slip_direction_logp(
     if vmf_kappa is None:
         raise ValueError("vmf_kappa must be provided for the von_mises_fisher likelihood")
 
-    # The weight scales the concentration; the vMF normalizer C3(kappa_eff)
-    # must use the same effective concentration (see Gaussian branch above).
+    # The weight scales the concentration; the normalizer must use the same
+    # effective concentration (see Gaussian branch above).
+    #
+    # The slip direction of a double couple is not free on the sphere: it lies
+    # on the great circle orthogonal to the fault normal. The normalizer is
+    # therefore the circular one, 1 / (2*pi*I0(kappa_eff)), not the spherical
+    # C3(kappa_eff) used before. At a fixed concentration the two differ by a
+    # stress-independent constant and the posterior is unchanged, but with
+    # shear-traction weighting kappa_eff varies with stress and the constant
+    # does not cancel. log I0 is evaluated in the exponentially scaled form so
+    # that large concentrations do not overflow.
     kappa_eff = safe_weight * float(vmf_kappa)
     dot = pt.clip(pt.sum(s_obs_unit * s_pred_unit, axis=-1), -1.0, 1.0)
-    log_sinh_kappa = kappa_eff + pt.log(-pt.expm1(-2.0 * kappa_eff)) - np.log(2.0)
-    log_c3 = pt.log(kappa_eff) - np.log(4.0 * np.pi) - log_sinh_kappa
-    return log_c3 + kappa_eff * dot
+    log_i0 = kappa_eff + pt.log(pt.ive(0.0, kappa_eff))
+    return kappa_eff * dot - np.log(2.0 * np.pi) - log_i0
 
 
 # Import stress_tensor_eigendecomposition from utils_stress
@@ -240,6 +250,7 @@ def _build_joint_model(
     mechanism_angles=None,
     mechanism_errors=None,
     fixed_plane_indices=None,
+    fault_population=None,
 ) -> Tuple["pm.Model", Optional[float]]:
     """Build the joint PyMC model shared by the SMC and NUTS entry points.
 
@@ -336,6 +347,21 @@ def _build_joint_model(
         return w1, w2
 
     mu_const: Optional[float] = None
+
+    n_events_total = int(np.shape(n1)[0])
+    pop_spec = _fp.resolve_population_spec(
+        fault_population,
+        selection_beta=float(instability_beta if selection_beta is None else selection_beta),
+        friction_range=friction_range,
+    )
+    if pop_spec["family"] != _fp.LEGACY:
+        if iterative_plane_selection or fixed_plane_indices is not None:
+            raise ValueError(
+                "A fault population requires the joint two-plane mixture; it cannot be "
+                "combined with iterative preselection or externally fixed plane labels"
+            )
+        if pop_spec["normalize"]:
+            pop_spec["_table"] = _fp.normalizer_table(pop_spec)
 
     with pm.Model() as model:
         if mechanism_angles is not None:
@@ -496,50 +522,130 @@ def _build_joint_model(
                 weight=w2,
             )
 
-            inst_delta = inst2 - inst1
-            beta_val = float(instability_beta if selection_beta is None else selection_beta)
-            beta = pt.as_tensor_variable(beta_val)
             eps = 1e-9
-            logit_local = beta * inst_delta
+            if pop_spec["family"] != _fp.LEGACY:
+                # --- Generative fault-population mixture (normalized) ---
+                # The plane weights follow from an explicit population density
+                # g(I) on the sphere of fault normals, so the per-event term is
+                # a probability density in the mechanism once divided by
+                # Z = E_n[g(I(n))]. See fault_population.py.
+                if signed_instability:
+                    raise ValueError(
+                        "signed_instability is not supported with a fault population: "
+                        "the population density is defined on fault normals alone"
+                    )
+                if clustering_prior_strength > 0.0:
+                    raise ValueError(
+                        "clustering_prior_strength is superseded by the fabric component; "
+                        "use fault_population={'family': ..., 'fabric_K': K}"
+                    )
+                if plane2_prior_probs_arr is not None and plane_prior_strength > 0.0:
+                    raise ValueError(
+                        "External plane priors are not yet supported with a fault population"
+                    )
 
-            # Certainty-weighted clustering prior
-            if clustering_prior_strength > 0.0:
-                p_tentative = pm.math.sigmoid(logit_local)
-                certainty = pt.square(2.0 * p_tentative - 1.0)
+                if pop_spec["family"] == "ramp" and pop_spec["imin"] == "infer":
+                    imin_lo, imin_hi = pop_spec["imin_bounds"]
+                    imin_var = pm.Uniform("I_min", lower=float(imin_lo), upper=float(imin_hi))
+                else:
+                    imin_var = None
 
-                M1 = n1[:, :, None] * n1[:, None, :]
-                M2 = n2[:, :, None] * n2[:, None, :]
+                log_g1 = _fp.log_population_weight_pt(inst1, pop_spec, imin_var)
+                log_g2 = _fp.log_population_weight_pt(inst2, pop_spec, imin_var)
 
-                sum_certainty = pt.sum(certainty) + 1e-12
-                T_conf = pt.sum(
-                    certainty[:, None, None] * (
-                        (1.0 - p_tentative)[:, None, None] * M1
-                        + p_tentative[:, None, None] * M2
-                    ),
-                    axis=0,
-                ) / sum_certainty
+                mix_weight = None
+                if pop_spec["mix_uniform"] or pop_spec["fabric_K"] > 0:
+                    mix_weight = pm.Uniform("w_population", lower=0.0, upper=1.0)
+                    if pop_spec["fabric_K"] > 0:
+                        K = int(pop_spec["fabric_K"])
+                        axis_raw = pm.Normal(
+                            "fabric_axis_raw", mu=0.0, sigma=1.0, shape=(K, 3),
+                            initval=np.random.default_rng(0).normal(size=(K, 3)),
+                        )
+                        axes = axis_raw / pt.sqrt(pt.sum(axis_raw ** 2, axis=1, keepdims=True) + 1e-9)
+                        pm.Deterministic("fabric_axes", axes)
+                        fabric_kappa = pm.HalfNormal(
+                            "fabric_kappa", sigma=float(pop_spec["fabric_kappa_sigma"]), shape=K,
+                        )
+                        if K > 1:
+                            fabric_pi = pm.Dirichlet("fabric_pi", a=np.ones(K))
+                            log_pi = pt.log(fabric_pi)
+                        else:
+                            log_pi = pt.zeros(1)
+                        log_h1 = _fp.log_watson_mixture_pt(n1, axes, fabric_kappa, log_pi)
+                        log_h2 = _fp.log_watson_mixture_pt(n2, axes, fabric_kappa, log_pi)
+                    else:
+                        log_h1 = pt.zeros_like(log_g1)
+                        log_h2 = pt.zeros_like(log_g2)
+                    log_w = pt.log(pt.clip(mix_weight, eps, 1.0 - eps))
+                    log_1mw = pt.log1p(-pt.clip(mix_weight, eps, 1.0 - eps))
+                    log_g1 = pt.logaddexp(log_w + log_g1, log_1mw + log_h1)
+                    log_g2 = pt.logaddexp(log_w + log_g2, log_1mw + log_h2)
 
-                E1 = pt.sum(n1 * pt.dot(T_conf, n1.T).T, axis=-1)
-                E2 = pt.sum(n2 * pt.dot(T_conf, n2.T).T, axis=-1)
+                # Prior plane probability implied by the population.
+                log_gsum = pt.logaddexp(log_g1, log_g2)
+                p2 = pm.Deterministic("p_plane2", pt.clip(pt.exp(log_g2 - log_gsum), eps, 1.0 - eps))
 
-                logit_local = logit_local + float(clustering_prior_strength) * (E2 - E1)
+                logw1 = log_g1 + ll1
+                logw2 = log_g2 + ll2
+                logmix = pt.logaddexp(logw1, logw2)
+                pm.Potential("likelihood", pt.sum(logmix))
 
-            if plane2_prior_probs_arr is not None and plane_prior_strength > 0.0:
-                prior_p2 = pt.as_tensor_variable(plane2_prior_probs_arr)
-                prior_p2 = pt.clip(prior_p2, eps, 1.0 - eps)
-                prior_logit = pt.log(prior_p2) - pt.log1p(-prior_p2)
-                p2 = pm.math.sigmoid(logit_local + float(plane_prior_strength) * prior_logit)
+                if pop_spec["normalize"]:
+                    log_Z = _fp.interp_normalizer_pt(
+                        pop_spec["_table"], Rratio, mu, imin_var
+                    )
+                    if mix_weight is not None:
+                        log_Z = pt.log(mix_weight * pt.exp(log_Z) + (1.0 - mix_weight))
+                    pm.Deterministic("log_Z_population", log_Z)
+                    pm.Potential("population_normalizer", -float(n_events_total) * log_Z)
+
+                p_plane2_post = pm.Deterministic("p_plane2_post", pt.exp(logw2 - logmix))
             else:
-                p2 = pm.math.sigmoid(logit_local)
-            p2 = pt.clip(p2, eps, 1.0 - eps)
-            p2 = pm.Deterministic("p_plane2", p2)
+                inst_delta = inst2 - inst1
+                beta_val = float(instability_beta if selection_beta is None else selection_beta)
+                beta = pt.as_tensor_variable(beta_val)
+                logit_local = beta * inst_delta
 
-            logw1 = pt.log1p(-p2) + ll1
-            logw2 = pt.log(p2) + ll2
-            logmix = pt.logaddexp(logw1, logw2)
-            pm.Potential("likelihood", pt.sum(logmix))
+                # Certainty-weighted clustering prior
+                if clustering_prior_strength > 0.0:
+                    p_tentative = pm.math.sigmoid(logit_local)
+                    certainty = pt.square(2.0 * p_tentative - 1.0)
 
-            p_plane2_post = pm.Deterministic("p_plane2_post", pt.exp(logw2 - logmix))
+                    M1 = n1[:, :, None] * n1[:, None, :]
+                    M2 = n2[:, :, None] * n2[:, None, :]
+
+                    sum_certainty = pt.sum(certainty) + 1e-12
+                    T_conf = pt.sum(
+                        certainty[:, None, None] * (
+                            (1.0 - p_tentative)[:, None, None] * M1
+                            + p_tentative[:, None, None] * M2
+                        ),
+                        axis=0,
+                    ) / sum_certainty
+
+                    E1 = pt.sum(n1 * pt.dot(T_conf, n1.T).T, axis=-1)
+                    E2 = pt.sum(n2 * pt.dot(T_conf, n2.T).T, axis=-1)
+
+                    logit_local = logit_local + float(clustering_prior_strength) * (E2 - E1)
+
+                if plane2_prior_probs_arr is not None and plane_prior_strength > 0.0:
+                    prior_p2 = pt.as_tensor_variable(plane2_prior_probs_arr)
+                    prior_p2 = pt.clip(prior_p2, eps, 1.0 - eps)
+                    prior_logit = pt.log(prior_p2) - pt.log1p(-prior_p2)
+                    p2 = pm.math.sigmoid(logit_local + float(plane_prior_strength) * prior_logit)
+                else:
+                    p2 = pm.math.sigmoid(logit_local)
+                p2 = pt.clip(p2, eps, 1.0 - eps)
+                p2 = pm.Deterministic("p_plane2", p2)
+
+                logw1 = pt.log1p(-p2) + ll1
+                logw2 = pt.log(p2) + ll2
+                logmix = pt.logaddexp(logw1, logw2)
+                pm.Potential("likelihood", pt.sum(logmix))
+
+                p_plane2_post = pm.Deterministic("p_plane2_post", pt.exp(logw2 - logmix))
+
             tau_mag = (1.0 - p_plane2_post) * tau1 + p_plane2_post * tau2
 
         # --- Optional: constant-shear constraint ---
@@ -572,6 +678,46 @@ def _build_joint_model(
                 pm.Potential("shear_const_penalty", -sw * pen)
 
     return model, mu_const
+
+
+def _population_results(idata, fault_population) -> Optional[Dict[str, Any]]:
+    """Summarize the fault-population parameters and the basin structure.
+
+    Returns ``None`` for the historical unnormalized mixture. Population models
+    are multimodal on real catalogs, so the basin report is part of the result
+    rather than an optional diagnostic: a large r_hat there usually means the
+    chains explored different basins and must be summarized separately.
+    """
+    if fault_population is None or str(fault_population).strip().lower() in {"legacy", "none", "off"}:
+        return None
+    out: Dict[str, Any] = {"spec": fault_population}
+    post = getattr(idata, "posterior", None)
+    if post is None:
+        return out
+    for name in ("I_min", "w_population", "log_Z_population"):
+        if name in post:
+            values = post[name].values
+            out[name] = {
+                "median": float(np.median(values)),
+                "equal_tail_90": [float(np.quantile(values, 0.05)),
+                                  float(np.quantile(values, 0.95))],
+            }
+    if "fabric_kappa" in post:
+        out["fabric_kappa_median"] = np.median(post["fabric_kappa"].values, axis=(0, 1)).tolist()
+        if "fabric_pi" in post:
+            out["fabric_pi_median"] = np.median(post["fabric_pi"].values, axis=(0, 1)).tolist()
+    try:
+        from . import basins as _basins
+    except ImportError:
+        try:
+            import basins as _basins
+        except ImportError:
+            return out
+    try:
+        out["basins"] = _basins.basin_report(idata)
+    except Exception as exc:  # pragma: no cover - diagnostics must not break a run
+        warnings.warn(f"Basin report failed: {exc}", RuntimeWarning)
+    return out
 
 
 def Bayesian_joint_plane_selection_SMC(
@@ -648,6 +794,7 @@ def Bayesian_joint_plane_selection_SMC(
     dip_sigma_deg=5.0,
     rake_sigma_deg=5.0,
     fixed_plane_indices: Optional[np.ndarray] = None,
+    fault_population=None,
 ) -> Dict[str, Any]:
     """
     Joint Bayesian inference of stress orientation, shape ratio, and nodal plane selection using SMC.
@@ -665,6 +812,35 @@ def Bayesian_joint_plane_selection_SMC(
     input plane 1/2). This bypasses instability and clustering for selection,
     without fixing the uncertain geometry. It cannot be combined with iterative
     preselection. Friction is not identifiable from the fixed-plane likelihood.
+
+    fault_population selects the model used for nodal-plane selection.
+
+    ``None`` (default) keeps the historical behaviour: the mixture weights are
+    ``sigmoid(beta * (I2 - I1))`` and the mixture is used without a normalizer.
+    That term is not a probability density in the observed mechanism, and its
+    total mass grows with mu, which biases the inferred friction upward. Results
+    obtained with it are reproduced exactly by this default.
+
+    Any other value replaces the logistic weight by an explicit fault-population
+    density g(I) on the sphere of fault normals and adds the matching normalizer
+    ``-N log Z(R, mu)``, so that the per-event term is a density. Pass a family
+    name or a dictionary, for example
+
+        fault_population="exp"
+            g = exp(beta I), the generative model whose plane probabilities are
+            identical to the historical weights, now normalized.
+        fault_population={"family": "ramp", "imin": "infer"}
+            g = softplus(k (I - I_min)) / (k (1 - I_min)) with I_min inferred,
+            the recommended stress-controlled model.
+        fault_population={"family": "ramp", "imin": "infer", "fabric_K": 2}
+            adds K axial Watson clusters for an inherited fabric, with the
+            stress-selected fraction w inferred and reported as ``w_population``.
+
+    The normalizer is tabulated once per configuration and cached on disk; the
+    first call with a new configuration spends a few minutes building it. See
+    fault_population.py for the full set of options, and basins.py for the
+    basin diagnostics and per-basin evidence these models require, since they
+    are multimodal on real catalogs.
 
     This function implements the Sequential Monte Carlo approach described in SMC.md, which jointly
     infers stress parameters and selects the fault plane for each focal mechanism in a single
@@ -1022,6 +1198,7 @@ def Bayesian_joint_plane_selection_SMC(
         n1=n1, n2=n2, s1=s1, s2=s2,
         mechanism_angles=mechanism_angles, mechanism_errors=mechanism_errors,
         fixed_plane_indices=fixed_plane_indices,
+        fault_population=fault_population,
         q_prior_mu_arr=q_prior_mu_arr, q_prior_sigma=q_prior_sigma,
         R_prior_mu_val=R_prior_mu_val, R_prior_sigma=R_prior_sigma,
         infer_friction=infer_friction,
@@ -1192,6 +1369,7 @@ def Bayesian_joint_plane_selection_SMC(
 
     results["mechanism_sigma_deg"] = mechanism_errors.copy()
     results["fixed_plane_indices"] = None if fixed_plane_indices is None else fixed_plane_indices.copy()
+    results["fault_population"] = _population_results(idata, fault_population)
 
     # Plane selection probabilities and MAP estimates
     if return_plane_probabilities:
@@ -1391,6 +1569,7 @@ def Bayesian_joint_plane_selection_NUTS(
     dip_sigma_deg=5.0,
     rake_sigma_deg=5.0,
     fixed_plane_indices: Optional[np.ndarray] = None,
+    fault_population=None,
     initvals=None,
 ) -> Dict[str, Any]:
     """
@@ -1409,6 +1588,35 @@ def Bayesian_joint_plane_selection_NUTS(
     input plane 1/2). This bypasses instability and clustering for selection,
     without fixing the uncertain geometry. It cannot be combined with iterative
     preselection. Friction is not identifiable from the fixed-plane likelihood.
+
+    fault_population selects the model used for nodal-plane selection.
+
+    ``None`` (default) keeps the historical behaviour: the mixture weights are
+    ``sigmoid(beta * (I2 - I1))`` and the mixture is used without a normalizer.
+    That term is not a probability density in the observed mechanism, and its
+    total mass grows with mu, which biases the inferred friction upward. Results
+    obtained with it are reproduced exactly by this default.
+
+    Any other value replaces the logistic weight by an explicit fault-population
+    density g(I) on the sphere of fault normals and adds the matching normalizer
+    ``-N log Z(R, mu)``, so that the per-event term is a density. Pass a family
+    name or a dictionary, for example
+
+        fault_population="exp"
+            g = exp(beta I), the generative model whose plane probabilities are
+            identical to the historical weights, now normalized.
+        fault_population={"family": "ramp", "imin": "infer"}
+            g = softplus(k (I - I_min)) / (k (1 - I_min)) with I_min inferred,
+            the recommended stress-controlled model.
+        fault_population={"family": "ramp", "imin": "infer", "fabric_K": 2}
+            adds K axial Watson clusters for an inherited fabric, with the
+            stress-selected fraction w inferred and reported as ``w_population``.
+
+    The normalizer is tabulated once per configuration and cached on disk; the
+    first call with a new configuration spends a few minutes building it. See
+    fault_population.py for the full set of options, and basins.py for the
+    basin diagnostics and per-basin evidence these models require, since they
+    are multimodal on real catalogs.
 
     NUTS cannot sample discrete plane indicators z_i directly. This implementation uses a
     differentiable marginalization: each event likelihood is a 2-component mixture over the two
@@ -1570,6 +1778,7 @@ def Bayesian_joint_plane_selection_NUTS(
         n1=n1, n2=n2, s1=s1, s2=s2,
         mechanism_angles=mechanism_angles, mechanism_errors=mechanism_errors,
         fixed_plane_indices=fixed_plane_indices,
+        fault_population=fault_population,
         q_prior_mu_arr=q_prior_mu_arr, q_prior_sigma=q_prior_sigma,
         R_prior_mu_val=R_prior_mu_val, R_prior_sigma=R_prior_sigma,
         infer_friction=infer_friction,
@@ -1729,6 +1938,7 @@ def Bayesian_joint_plane_selection_NUTS(
 
     results["mechanism_sigma_deg"] = mechanism_errors.copy()
     results["fixed_plane_indices"] = None if fixed_plane_indices is None else fixed_plane_indices.copy()
+    results["fault_population"] = _population_results(idata, fault_population)
 
     if return_plane_probabilities:
         if iterative_plane_selection:
