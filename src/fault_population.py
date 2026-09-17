@@ -42,8 +42,11 @@ Both families may be mixed with a component that does not depend on the stress,
 
     g_mix(n) = w g(I(n)) + (1 - w) h(n),
 
-where ``h`` is either the uniform density (``mix_uniform``) or a mixture of
-axial Watson clusters representing an inherited fault fabric (``fabric_K``).
+where ``h`` is either the uniform density (``mix_uniform``) or a mixture of axial
+clusters representing an inherited fault fabric (``fabric_K``).  A fabric
+component is either Watson, which is symmetric about one axis, or Bingham, which
+is not and can represent the girdle produced by a fixed strike with variable dip
+(``fabric_family``).
 Each component of ``h`` is normalized against the uniform measure, so the
 normalizer of the mixture is ``w Z + (1 - w)``.  The weight ``w`` is the fraction
 of the orientation distribution explained by stress selection and is inferred.
@@ -63,6 +66,7 @@ import pytensor.tensor as pt
 
 __all__ = [
     "resolve_population_spec",
+    "log_bingham_mixture_pt",
     "instability_numpy",
     "instability_pt",
     "log_population_weight_pt",
@@ -109,8 +113,11 @@ def resolve_population_spec(
     k : float, sharpness of the ramp softplus
     normalize : bool, add the ``-N log Z`` potential
     mix_uniform : bool, add a uniform component with inferred weight
-    fabric_K : int, number of Watson fabric clusters, 0 to disable
+    fabric_K : int, number of fabric clusters, 0 to disable
+    fabric_family : {'watson', 'bingham'}, shape of one fabric component
     fabric_kappa_sigma : float, half-normal prior scale for the concentrations
+    fabric_pi_alpha : float, Dirichlet concentration on the fabric proportions;
+        values below one favour switching components off
     table : dict, overrides for the normalizer grid and sampling
     """
     if fault_population is None:
@@ -137,11 +144,17 @@ def resolve_population_spec(
         "normalize": bool(spec.get("normalize", True)),
         "mix_uniform": bool(spec.get("mix_uniform", False)),
         "fabric_K": int(spec.get("fabric_k", spec.get("fabric_K", 0))),
+        "fabric_family": str(spec.get("fabric_family", "watson")).strip().lower(),
         "fabric_kappa_sigma": float(spec.get("fabric_kappa_sigma", 40.0)),
+        "fabric_pi_alpha": float(spec.get("fabric_pi_alpha", 1.0)),
         "table": dict(spec.get("table", {})),
     }
     if out["fabric_K"] < 0:
         raise ValueError("fabric_K must be >= 0")
+    if out["fabric_family"] not in {"watson", "bingham"}:
+        raise ValueError("fabric_family must be 'watson' or 'bingham'")
+    if out["fabric_pi_alpha"] <= 0.0:
+        raise ValueError("fabric_pi_alpha must be > 0")
     if out["mix_uniform"] and out["fabric_K"] > 0:
         raise ValueError("Use either mix_uniform or fabric_K, not both")
 
@@ -364,6 +377,62 @@ def log_watson_mixture_pt(n, axes, kappa, log_pi, n_quad: int = 48):
                           axis=1))
     cos2 = pt.dot(n, axes.T) ** 2
     return pt.logsumexp(log_pi[None, :] + kappa[None, :] * cos2 - log_M[None, :], axis=1)
+
+
+def quat_to_rotation_pt(q):
+    """Rotation matrix of a unit quaternion ``(w, x, y, z)``, as a graph.
+
+    The columns are the three orthonormal axes.  This repeats the convention of
+    the stress orientation in :func:`bjsi._build_joint_model` so that the fabric
+    axes are expressed in the same frame as the fault normals.
+    """
+    w, x, y, z = q[0], q[1], q[2], q[3]
+    return pt.stacklists([
+        [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+        [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+        [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+    ])
+
+
+def _log_bingham_normalizer_pt(kappa1, kappa2, n_quad: int = 64):
+    """``log E_n[exp(-k1 (a1.n)^2 - k2 (a2.n)^2)]`` for normals uniform on the sphere.
+
+    Integrating the azimuth around the third axis leaves a one-dimensional
+    integral with a modified Bessel factor,
+
+        c = 1/2 int_-1^1 exp(-(1-z^2)(k1+k2)/2) I0((1-z^2)(k1-k2)/2) dz,
+
+    which is evaluated by Gauss-Legendre quadrature.  ``log I0`` uses the
+    exponentially scaled Bessel function so that large concentrations are safe.
+    """
+    nodes, weights = np.polynomial.legendre.leggauss(int(n_quad))
+    z2 = pt.as_tensor_variable(nodes ** 2)
+    log_w = pt.as_tensor_variable(np.log(weights / 2.0))
+    one_minus = 1.0 - z2[None, :]
+    half_sum = 0.5 * (kappa1 + kappa2)[:, None]
+    half_diff = pt.abs(0.5 * (kappa1 - kappa2))[:, None] * one_minus
+    log_i0 = half_diff + pt.log(pt.ive(0.0, half_diff))
+    return pt.logsumexp(log_w[None, :] - one_minus * half_sum + log_i0, axis=1)
+
+
+def log_bingham_mixture_pt(n, axes, kappas, log_pi, n_quad: int = 64):
+    """Log density of an axial Bingham mixture on the sphere, uniform reference.
+
+    ``axes`` has shape ``(K, 3, 3)`` with the three orthonormal axes of each
+    component in its columns, and ``kappas`` has shape ``(K, 2)`` holding the
+    non-negative concentrations against the first two axes.  Component ``k`` is
+
+        B_k(n) = exp(-k1 (a1.n)^2 - k2 (a2.n)^2) / c(k1, k2),
+
+    so that its expectation under the uniform measure is one.  Equal
+    concentrations give a Watson component about the third axis, a large ``k1``
+    with ``k2`` near zero gives a girdle in the plane of the second and third
+    axes, and the density is invariant to the sign of ``n`` and of each axis.
+    """
+    cos2 = pt.tensordot(n, axes, axes=[[1], [1]]) ** 2    # (N, K, 3), axis j in the columns
+    quad = -(kappas[None, :, 0] * cos2[:, :, 0] + kappas[None, :, 1] * cos2[:, :, 1])
+    log_c = _log_bingham_normalizer_pt(kappas[:, 0], kappas[:, 1], n_quad)
+    return pt.logsumexp(log_pi[None, :] + quad - log_c[None, :], axis=1)
 
 
 def _axis_index(grid: np.ndarray, value):

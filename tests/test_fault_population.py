@@ -398,3 +398,46 @@ def test_bridge_evidence_recovers_a_known_normalizer():
             + 0.5 * np.log(var_post / sigma ** 2) + 0.5 * mean_post ** 2 / var_post)
     got = basins.bridge_evidence(model, idata, 0, seed=2)["log_evidence"]
     assert abs(got - want) < 0.1, (got, want)
+
+
+# ----------------------------------------------------------------------------
+# Bingham fabric
+# ----------------------------------------------------------------------------
+def test_bingham_components_are_normalized():
+    """Each Bingham component has unit mean under the uniform measure."""
+    normals = fp.sobol_unit_normals(16, 4)
+    axes = np.stack([np.eye(3), np.eye(3)])
+    for k1, k2 in ((0.0, 0.0), (5.0, 5.0), (30.0, 0.0), (60.0, 20.0), (200.0, 3.0)):
+        log_h = fp.log_bingham_mixture_pt(
+            pt.as_tensor_variable(normals), pt.as_tensor_variable(axes),
+            pt.as_tensor_variable(np.array([[k1, k2], [k1, k2]])),
+            pt.as_tensor_variable(np.log(np.array([0.5, 0.5]))),
+        ).eval()
+        assert abs(np.mean(np.exp(log_h)) - 1.0) < 3e-3, (k1, k2)
+
+
+def test_bingham_reduces_to_watson_when_concentrations_are_equal():
+    normals = fp.sobol_unit_normals(14, 6)
+    axis = np.array([0.0, 0.0, 1.0])
+    kappa = 25.0
+    rotation = np.eye(3)
+    bingham = fp.log_bingham_mixture_pt(
+        pt.as_tensor_variable(normals), pt.as_tensor_variable(rotation[None]),
+        pt.as_tensor_variable(np.array([[kappa, kappa]])), pt.as_tensor_variable(np.zeros(1)),
+    ).eval()
+    watson = fp.log_watson_mixture_pt(
+        pt.as_tensor_variable(normals), pt.as_tensor_variable(axis[None]),
+        pt.as_tensor_variable(np.array([kappa])), pt.as_tensor_variable(np.zeros(1)),
+    ).eval()
+    assert np.max(np.abs(bingham - watson)) < 1e-6
+
+
+def test_bingham_fabric_model_builds_and_is_finite():
+    model = build({"family": "ramp", "imin": "infer", "fabric_K": 2,
+                   "fabric_family": "bingham", "fabric_pi_alpha": 0.5,
+                   "table": {"R_points": 21, "mu_points": 17, "imin_points": 20, "power": 14}})
+    names = [v.name for v in model.free_RVs]
+    for expected in ("w_population", "fabric_quat_raw", "fabric_kappa", "fabric_pi"):
+        assert expected in names
+    values = eval_vars(model, model.potentials, at_point(model))
+    assert all(np.isfinite(float(v)) for v in values)

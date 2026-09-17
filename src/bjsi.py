@@ -558,22 +558,44 @@ def _build_joint_model(
                     mix_weight = pm.Uniform("w_population", lower=0.0, upper=1.0)
                     if pop_spec["fabric_K"] > 0:
                         K = int(pop_spec["fabric_K"])
-                        axis_raw = pm.Normal(
-                            "fabric_axis_raw", mu=0.0, sigma=1.0, shape=(K, 3),
-                            initval=np.random.default_rng(0).normal(size=(K, 3)),
-                        )
-                        axes = axis_raw / pt.sqrt(pt.sum(axis_raw ** 2, axis=1, keepdims=True) + 1e-9)
-                        pm.Deterministic("fabric_axes", axes)
-                        fabric_kappa = pm.HalfNormal(
-                            "fabric_kappa", sigma=float(pop_spec["fabric_kappa_sigma"]), shape=K,
-                        )
+                        rng_init = np.random.default_rng(0)
                         if K > 1:
-                            fabric_pi = pm.Dirichlet("fabric_pi", a=np.ones(K))
+                            fabric_pi = pm.Dirichlet(
+                                "fabric_pi", a=float(pop_spec["fabric_pi_alpha"]) * np.ones(K),
+                            )
                             log_pi = pt.log(fabric_pi)
                         else:
                             log_pi = pt.zeros(1)
-                        log_h1 = _fp.log_watson_mixture_pt(n1, axes, fabric_kappa, log_pi)
-                        log_h2 = _fp.log_watson_mixture_pt(n2, axes, fabric_kappa, log_pi)
+                        if pop_spec["fabric_family"] == "bingham":
+                            # One component is a rotation, giving three orthonormal
+                            # axes, and two concentrations against the first two of
+                            # them. Equal concentrations reproduce a Watson
+                            # component; one large and one near zero give a girdle.
+                            quat_raw = pm.Normal(
+                                "fabric_quat_raw", mu=0.0, sigma=1.0, shape=(K, 4),
+                                initval=rng_init.normal(size=(K, 4)),
+                            )
+                            quats = quat_raw / pt.sqrt(pt.sum(quat_raw ** 2, axis=1, keepdims=True) + 1e-9)
+                            axes = pt.stack([_fp.quat_to_rotation_pt(quats[k]) for k in range(K)])
+                            pm.Deterministic("fabric_axes", axes)
+                            fabric_kappa = pm.HalfNormal(
+                                "fabric_kappa", sigma=float(pop_spec["fabric_kappa_sigma"]),
+                                shape=(K, 2),
+                            )
+                            log_h1 = _fp.log_bingham_mixture_pt(n1, axes, fabric_kappa, log_pi)
+                            log_h2 = _fp.log_bingham_mixture_pt(n2, axes, fabric_kappa, log_pi)
+                        else:
+                            axis_raw = pm.Normal(
+                                "fabric_axis_raw", mu=0.0, sigma=1.0, shape=(K, 3),
+                                initval=rng_init.normal(size=(K, 3)),
+                            )
+                            axes = axis_raw / pt.sqrt(pt.sum(axis_raw ** 2, axis=1, keepdims=True) + 1e-9)
+                            pm.Deterministic("fabric_axes", axes)
+                            fabric_kappa = pm.HalfNormal(
+                                "fabric_kappa", sigma=float(pop_spec["fabric_kappa_sigma"]), shape=K,
+                            )
+                            log_h1 = _fp.log_watson_mixture_pt(n1, axes, fabric_kappa, log_pi)
+                            log_h2 = _fp.log_watson_mixture_pt(n2, axes, fabric_kappa, log_pi)
                     else:
                         log_h1 = pt.zeros_like(log_g1)
                         log_h2 = pt.zeros_like(log_g2)
