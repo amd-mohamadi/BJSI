@@ -32,7 +32,7 @@ from typing import Any, Dict, List, Optional, Sequence
 import numpy as np
 import pytensor
 
-__all__ = ["basin_report", "bridge_evidence", "chain_summary"]
+__all__ = ["basin_report", "bridge_evidence", "chain_summary", "subset_results"]
 
 
 def _stress_directions(tensors: np.ndarray) -> tuple:
@@ -70,36 +70,82 @@ def chain_summary(idata, extra_vars: Sequence[str] = ()) -> List[Dict[str, Any]]
     return rows
 
 
-def basin_report(idata, *, shmax_tol: float = 5.0, R_tol: float = 0.1,
-                 plane_tol: float = 0.1) -> Dict[str, Any]:
+def basin_report(idata, *, shmax_tol: float = 5.0, R_tol: float = 0.05,
+                 plane_tol: float = 0.05) -> Dict[str, Any]:
     """Group chains into basins and describe each one.
 
     Two chains share a basin when their median SHmax differs by less than
     ``shmax_tol`` degrees, their median ``R`` by less than ``R_tol``, and the
-    fraction of events assigned to plane two by less than ``plane_tol``.  SHmax
-    is compared as an axis, so 179 and 1 degree are one degree apart.
+    fraction of events they assign to different planes is below ``plane_tol``.
+    SHmax is compared as an axis, so 179 and 1 degree are one degree apart.
+    Chains are compared with the first chain of a basin, not with each other,
+    so a basin cannot grow by chaining small differences.  Basins are listed
+    with the most chains first and labelled ``basin_1``, ``basin_2``, ...
     """
     rows = chain_summary(idata)
+    post = idata.posterior
+    plane_maps = None
+    if "p_plane2_post" in post:
+        plane_maps = [post["p_plane2_post"].values[c].mean(0) > 0.5 for c in range(post.sizes["chain"])]
     basins: List[Dict[str, Any]] = []
     for row in rows:
         for basin in basins:
             d_shmax = abs(row["shmax"] - basin["shmax"])
             d_shmax = min(d_shmax, 180.0 - d_shmax)
             same = d_shmax < shmax_tol and abs(row["R"] - basin["R"]) < R_tol
-            if same and "plane2_fraction" in row and "plane2_fraction" in basin:
-                same = abs(row["plane2_fraction"] - basin["plane2_fraction"]) < plane_tol
+            if same and plane_maps is not None:
+                same = np.mean(plane_maps[row["chain"]] != plane_maps[basin["chains"][0]]) < plane_tol
             if same:
                 basin["chains"].append(row["chain"])
                 break
         else:
             basin = dict(row)
-            basin["chains"] = [row.pop("chain")]
+            basin["chains"] = [basin.pop("chain")]
             basins.append(basin)
+    # Dominant basin first: most chains, then earliest chain.
+    basins.sort(key=lambda b: (-len(b["chains"]), b["chains"][0]))
     for index, basin in enumerate(basins):
-        basin["label"] = f"basin_{index}"
-        basin.pop("chain", None)
+        basin["label"] = f"basin_{index + 1}"
     return {"n_basins": len(basins), "basins": basins, "per_chain": rows,
             "multimodal": len(basins) > 1}
+
+
+def subset_results(results: Dict[str, Any], chains: Sequence[int],
+                   hdi_prob: Optional[float] = None) -> Dict[str, Any]:
+    """Re-summarize a sampler result over a subset of its chains.
+
+    The sampler pools all chains; when they sit in different basins the pooled
+    element-wise median tensor and the pooled HDIs describe no basin.  This
+    returns a copy of ``results`` with every posterior-derived entry (stress
+    tensor, principal axes, R, friction, HDIs, plane probabilities and
+    selection map, per-draw principal axes) recomputed from ``chains`` only,
+    ready for the same output tools as the full result.  Entries that do not
+    depend on the posterior draws, such as the population spec and the basin
+    report, are kept.
+    """
+    try:
+        from .bjsi import summarize_posterior
+    except ImportError:
+        from bjsi import summarize_posterior
+    chains = [int(c) for c in chains]
+    idata = results["idata"]
+    n_chains = idata.posterior.sizes["chain"]
+    if not chains or any(c < 0 or c >= n_chains for c in chains):
+        raise ValueError(f"chains must be a non-empty subset of range({n_chains}), got {chains}")
+    if hdi_prob is None:
+        hdi_prob = float((results.get("hdi") or {}).get("prob", 0.9))
+    fixed_mu = results.get("mu") if results.get("mu_samples") is None else None
+    out = dict(results)
+    out.update(summarize_posterior(idata.sel(chain=chains), hdi_prob=hdi_prob))
+    if fixed_mu is not None:
+        out["mu"] = fixed_mu
+    if results.get("fixed_plane_indices") is not None:
+        out["plane_selection_map"] = results["plane_selection_map"]
+        out["plane_probabilities"] = results["plane_probabilities"]
+    out["convergence"] = dict(results.get("convergence") or {},
+                              n_chains=len(chains), chains=chains,
+                              n_samples=len(chains) * idata.posterior.sizes["draw"])
+    return out
 
 
 def _unconstrained_draws(model, idata, chain: int) -> tuple:

@@ -1459,3 +1459,129 @@ def plot_focal_mechanisms_map(
     fig.tight_layout()
     fig.savefig(output_png, dpi=300)
     plt.close(fig)
+
+
+# ---------------------------------------------------------------------------
+# Fabric overlay
+# ---------------------------------------------------------------------------
+
+def fabric_components_from_posterior(idata) -> list:
+    """Sign-invariant posterior summary of each fabric component.
+
+    Axis medians are meaningless because every axis is defined up to sign and
+    the components are exchangeable within a chain, so each component is
+    summarized through its orientation matrix, which is invariant to both.
+    For Bingham components (``fabric_axes`` of shape (K, 3, 3)) the matrix is
+    ``M = k1 a1 a1' + k2 a2 a2'``; its eigenvectors are the axes and the
+    eigenvalues, shifted so the smallest is zero, the concentrations.  For
+    Watson components (``fabric_axes`` of shape (K, 3)) it is ``-k a a'``.
+
+    Returns a list of dicts with ``pi``, ``axes`` (columns), ``kappa`` (3,)
+    such that the log density is ``-n' A diag(kappa) A' n`` + const, and
+    ``family``.
+    """
+    post = idata.posterior
+    axes = post["fabric_axes"].values          # (chain, draw, K, 3, 3) or (chain, draw, K, 3)
+    kappa = post["fabric_kappa"].values
+    K = axes.shape[2]
+    # A single component has no mixture weight variable (K = 1 in the model).
+    pi = post["fabric_pi"].values if "fabric_pi" in post else np.ones(axes.shape[:2] + (K,))
+    out = []
+    for k in range(K):
+        if axes.ndim == 5:
+            family = "bingham"
+            a = axes[:, :, k].reshape(-1, 3, 3)          # columns are axes
+            kk = kappa[:, :, k].reshape(-1, 2)
+            M = np.einsum("sj,sij,slj->sil", kk, a[:, :, :2], a[:, :, :2]).mean(0)
+        else:
+            family = "watson"
+            a = axes[:, :, k].reshape(-1, 3)
+            kk = kappa[:, :, k].reshape(-1)
+            M = -np.einsum("s,si,sl->sil", kk, a, a).mean(0)
+        vals, vecs = np.linalg.eigh(M)
+        vals = vals - vals.min()
+        out.append({"pi": float(np.median(pi[:, :, k])), "axes": vecs, "kappa": vals,
+                    "family": family})
+    return out
+
+
+def _fabric_log_density_grid(component, n_lon: int = 181, n_lat: int = 91):
+    """Log density of one component on a lon/lat grid of the lower hemisphere."""
+    import mplstereonet
+    lon = np.linspace(-np.pi / 2, np.pi / 2, n_lon)
+    lat = np.linspace(-np.pi / 2, np.pi / 2, n_lat)
+    LON, LAT = np.meshgrid(lon, lat)
+    plunge, bearing = mplstereonet.geographic2plunge_bearing(LON.ravel(), LAT.ravel())
+    p, b = np.radians(plunge), np.radians(bearing)
+    # (north, west, up) unit vectors of the downward-pointing line; the density is axial.
+    n = np.stack([np.cos(p) * np.cos(b), -np.cos(p) * np.sin(b), -np.sin(p)], axis=1)
+    A, kap = component["axes"], component["kappa"]
+    logh = -np.sum(kap[None, :] * (n @ A) ** 2, axis=1)
+    return LON, LAT, logh.reshape(LON.shape)
+
+
+def _hdr_levels(logh, LAT, probs=(0.5, 0.9)):
+    """Density thresholds enclosing the given fractions of the component's mass."""
+    w = np.cos(LAT).ravel()
+    h = np.exp(logh.ravel() - logh.max())
+    order = np.argsort(-h)
+    cum = np.cumsum((h * w)[order]) / np.sum(h * w)
+    return [float(np.log(h[order][np.searchsorted(cum, p)])) + logh.max() for p in probs]
+
+
+def plot_pt_axes_fabric(outpath, strikes, dips, rakes, idata, hdr=(0.5, 0.9), title=None,
+                        ilsi_src_path: Optional[str] = DEFAULT_ILSI_SRC):
+    """PT-axes stereonet with the fault-normal density of each fabric component.
+
+    Each component is drawn as the regions enclosing ``hdr`` fractions of its
+    mass (lower hemisphere, poles to planes), labelled with its weight and
+    concentrations.  The selected planes' poles are shown as small grey dots
+    so the fit of the fabric to its data can be judged on the same figure.
+    """
+    import matplotlib.pyplot as plt
+    _, utils_stress = _safe_import_ilsi(ilsi_src_path)
+    n, s = utils_stress.normal_slip_vectors(strikes, dips, rakes)
+    p_or = np.zeros((len(strikes), 2)); t_or = np.zeros((len(strikes), 2)); n_or = np.zeros((len(strikes), 2))
+    for i in range(len(strikes)):
+        p_vec, t_vec, _ = utils_stress.p_t_b_axes(n[:, i], s[:, i])
+        p_or[i] = utils_stress.get_bearing_plunge(p_vec)
+        t_or[i] = utils_stress.get_bearing_plunge(t_vec)
+        n_or[i] = utils_stress.get_bearing_plunge(n[:, i])
+
+    components = fabric_components_from_posterior(idata)
+    fig = plt.figure(figsize=(9, 8))
+    ax = fig.add_subplot(111, projection="stereonet")
+    colors = plt.get_cmap("tab10").colors
+    handles = []
+    for k, comp in enumerate(components):
+        LON, LAT, logh = _fabric_log_density_grid(comp)
+        levels = _hdr_levels(logh, LAT, hdr)
+        color = colors[k % len(colors)]
+        minor = comp["pi"] < 0.05     # outline only, so the components that carry mass stand out
+        if not minor:
+            ax.contourf(LON, LAT, logh, levels=[levels[-1], levels[0], logh.max() + 1e-9],
+                        colors=[color, color], alpha=0.25)
+        ax.contour(LON, LAT, logh, levels=levels[::-1], colors=[color],
+                   linewidths=[0.6, 0.9] if minor else [0.8, 1.6],
+                   linestyles="dashed" if minor else "solid")
+        k_big, k_small = comp["kappa"][2], comp["kappa"][1]   # eigenvalues ascending, smallest shifted to 0
+        shape = ("girdle" if k_small < 0.25 * k_big else "cap" if k_small > 0.75 * k_big else "elliptical")
+        handles.append(plt.Line2D([], [], color=color, lw=2, linestyle="dashed" if minor else "solid",
+                                  label=f"fabric {k + 1}: pi={comp['pi']:.2f}, kappa=({k_big:.0f}, {k_small:.0f}) {shape}"))
+    ax.line(n_or[:, 1], n_or[:, 0], marker=".", color="0.4", markersize=3, linestyle="none", alpha=0.6)
+    ax.line(t_or[:, 1], t_or[:, 0], marker="x", color="C0", linestyle="none")
+    ax.line(p_or[:, 1], p_or[:, 0], marker="o", color="C3", linestyle="none", markersize=4)
+    handles += [plt.Line2D([], [], marker="o", color="C3", linestyle="none", label="P-axis"),
+                plt.Line2D([], [], marker="x", color="C0", linestyle="none", label="T-axis"),
+                plt.Line2D([], [], marker=".", color="0.4", linestyle="none", label="pole of selected plane")]
+    ax.set_aspect("equal"); ax.grid(True)
+    ax.legend(handles=handles, loc="upper left", bbox_to_anchor=(0.98, 1.0), fontsize=8,
+              title=f"fabric (posterior-mean orientation matrix): {int(hdr[0] * 100)}% / {int(hdr[-1] * 100)}% mass")
+    if title:
+        ax.set_title(title, y=1.05)
+    if idata.posterior.sizes["chain"] > 1 and "pooled" in str(title or ""):
+        ax.text(0.5, -0.06, "components averaged over all chains; if chains sit in different basins this blends their fabrics",
+                transform=ax.transAxes, ha="center", fontsize=8, color="0.3")
+    fig.savefig(outpath, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    return components

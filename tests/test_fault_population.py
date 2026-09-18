@@ -68,10 +68,23 @@ def eval_vars(model, names, point=None):
 
 
 def at_point(model, **overrides):
+    """A common stress state for legacy and population models.
+
+    The two use different rotation charts (Gaussian 4-vector vs gnomonic),
+    so the same unit quaternion is written in whichever the model has.
+    """
     ip = model.initial_point()
-    ip["q_raw"] = np.array([0.3, 0.5, -0.2, 0.7])
+    q = np.asarray(overrides.pop("q_raw", [0.3, 0.5, -0.2, 0.7]), float)
+    if "q_gnomonic" in ip:
+        ip["q_gnomonic"] = q[1:] / q[0]
+    else:
+        ip["q_raw"] = q
     ip.update(overrides)
     return ip
+
+
+def likelihood_potential(model):
+    return next(p for p in model.potentials if p.name == "likelihood")
 
 
 # ----------------------------------------------------------------------------
@@ -147,7 +160,7 @@ def test_exp_population_matches_legacy_plane_prior():
     pop = build({"family": "exp", "beta": 10.0, "normalize": False})
     p_legacy = eval_vars(legacy, ["p_plane2"], at_point(legacy))[0]
     p_pop = eval_vars(pop, ["p_plane2"], at_point(pop))[0]
-    assert np.max(np.abs(p_legacy - p_pop)) < 1e-9
+    assert np.max(np.abs(p_legacy - p_pop)) < 1e-6   # legacy normalizes with |q| + 1e-8
 
 
 def test_exp_population_adds_the_orientation_evidence():
@@ -164,14 +177,14 @@ def test_exp_population_adds_the_orientation_evidence():
     for q in ([0.3, 0.5, -0.2, 0.7], [0.1, -0.6, 0.4, 0.2]):
         for r_logit, mu_logit in ((0.2, -0.5), (-0.8, 1.1)):
             kw = dict(q_raw=np.array(q), R_logodds__=r_logit, mu_raw_logodds__=mu_logit)
-            a = float(eval_vars(legacy, [legacy.potentials[0]], at_point(legacy, **kw))[0])
-            b = float(eval_vars(pop, [pop.potentials[0]], at_point(pop, **kw))[0])
+            a = float(eval_vars(legacy, [likelihood_potential(legacy)], at_point(legacy, **kw))[0])
+            b = float(eval_vars(pop, [likelihood_potential(pop)], at_point(pop, **kw))[0])
             Sigma, mu = eval_vars(pop, ["Sigma", "mu"], at_point(pop, **kw))
             evidence = np.sum(np.logaddexp(
                 10.0 * instability_from_sigma(n1, Sigma, float(mu)),
                 10.0 * instability_from_sigma(n2, Sigma, float(mu)),
             ))
-            assert abs((b - a) - evidence) < 1e-8, (b - a, evidence)
+            assert abs((b - a) - evidence) < 1e-4, (b - a, evidence)   # legacy normalizes by |q| + 1e-8
 
 
 def instability_from_sigma(n, Sigma, mu):
@@ -298,7 +311,7 @@ def test_fabric_adds_watson_parameters_and_is_finite():
     model = build({"family": "ramp", "imin": "infer", "fabric_K": 2,
                    "table": {"R_points": 21, "mu_points": 17, "imin_points": 20, "power": 14}})
     names = [v.name for v in model.free_RVs]
-    for expected in ("w_population", "fabric_axis_raw", "fabric_kappa", "fabric_pi"):
+    for expected in ("w_population", "fabric_quat_gnomonic", "fabric_kappa", "fabric_pi"):
         assert expected in names
     values = eval_vars(model, model.potentials, at_point(model))
     assert all(np.isfinite(float(v)) for v in values)
@@ -437,7 +450,68 @@ def test_bingham_fabric_model_builds_and_is_finite():
                    "fabric_family": "bingham", "fabric_pi_alpha": 0.5,
                    "table": {"R_points": 21, "mu_points": 17, "imin_points": 20, "power": 14}})
     names = [v.name for v in model.free_RVs]
-    for expected in ("w_population", "fabric_quat_raw", "fabric_kappa", "fabric_pi"):
+    for expected in ("w_population", "fabric_quat_gnomonic", "fabric_kappa", "fabric_pi"):
         assert expected in names
     values = eval_vars(model, model.potentials, at_point(model))
     assert all(np.isfinite(float(v)) for v in values)
+
+
+def test_subset_results_recomputes_from_selected_chains():
+    """Per-basin summaries must come from the selected chains only."""
+    import arviz as az
+    import basins as basins_mod
+    from bjsi import summarize_posterior
+
+    rng = np.random.default_rng(0)
+    n_chain, n_draw, n_ev = 3, 50, 5
+    R = np.stack([np.full(n_draw, r) + 0.01 * rng.standard_normal(n_draw) for r in (0.2, 0.6, 0.6)])
+    Sigma = np.zeros((n_chain, n_draw, 3, 3))
+    for c in range(n_chain):
+        Sigma[c, :, 0, 0], Sigma[c, :, 1, 1], Sigma[c, :, 2, 2] = -1.0, 2 * R[c] - 1, 1.0
+    p2 = np.where(np.arange(n_chain)[:, None, None] == 0, 0.9, 0.1) * np.ones((n_chain, n_draw, n_ev))
+    idata = az.from_dict(posterior={"R": R, "Sigma": Sigma, "mu": np.full((n_chain, n_draw), 0.5),
+                                    "p_plane2_post": p2})
+    full = summarize_posterior(idata)
+    full["convergence"] = {"n_chains": n_chain}
+    sub = basins_mod.subset_results(full, [1, 2])
+    assert abs(sub["R_median"] - 0.6) < 0.02 and abs(full["R_median"] - 0.6) < 0.02
+    assert sub["idata"].posterior.sizes["chain"] == 2
+    assert np.all(sub["plane_selection_map"] == 0)
+    assert sub["convergence"]["chains"] == [1, 2]
+    with pytest.raises(ValueError):
+        basins_mod.subset_results(full, [5])
+    report = basins_mod.basin_report(idata)
+    assert [b["chains"] for b in report["basins"]] == [[1, 2], [0]]
+    assert report["basins"][0]["label"] == "basin_1"
+    assert all("chain" in row for row in report["per_chain"])
+
+
+def test_gnomonic_rotation_prior_is_haar():
+    """The chart's target density is the Haar measure: E[R_ij^2] = 1/3, E[q_i^2] = 1/4."""
+    import pymc as pm
+    import pytensor.tensor as pt
+    rng = np.random.default_rng(1)
+    # Trivariate Cauchy draws, the density the chart's potential targets.
+    v = rng.standard_normal((20000, 3)) / np.abs(rng.standard_normal((20000, 1)))
+    q = np.concatenate([np.ones((len(v), 1)), v], axis=1) / np.sqrt(1 + np.sum(v ** 2, axis=1))[:, None]
+    assert np.allclose(np.mean(q ** 2, axis=0), 0.25, atol=0.02)
+    Rm = np.asarray(pt.stack([fp.quat_to_rotation_pt(pt.as_tensor(qi)) for qi in q[:2000]]).eval())
+    assert np.allclose(np.mean(Rm ** 2, axis=0), 1.0 / 3.0, atol=0.05)
+    # The model potential implements exactly that density (up to a constant).
+    with pm.Model() as m:
+        fp.gnomonic_rotation("t", ())
+    logp = m.compile_logp()
+    pts = [np.zeros(3), np.array([0.5, -0.2, 1.0]), np.array([2.0, 1.0, -1.5])]
+    vals = [float(logp({"t_gnomonic": x})) + 2.0 * np.log1p(x @ x) for x in pts]
+    assert np.allclose(vals, vals[0])
+    # Symmetric-copy initval reproduces the rotation up to axis signs.
+    rng = np.random.default_rng(0)
+    for _ in range(5):
+        qq = rng.normal(size=4); qq /= np.linalg.norm(qq)
+        v0 = fp.gnomonic_initval(qq)
+        q1 = np.concatenate([[1.0], v0]) / np.sqrt(1 + v0 @ v0)
+        Ra = np.asarray(fp.quat_to_rotation_pt(pt.as_tensor(qq)).eval())
+        Rb = np.asarray(fp.quat_to_rotation_pt(pt.as_tensor(q1)).eval())
+        D = Ra.T @ Rb
+        assert np.allclose(np.abs(np.diag(D)), 1.0) and np.allclose(D - np.diag(np.diag(D)), 0.0, atol=1e-9)
+        assert np.linalg.norm(v0) <= np.sqrt(3) + 1e-9

@@ -50,6 +50,18 @@ is not and can represent the girdle produced by a fixed strike with variable dip
 Each component of ``h`` is normalized against the uniform measure, so the
 normalizer of the mixture is ``w Z + (1 - w)``.  The weight ``w`` is the fraction
 of the orientation distribution explained by stress selection and is inferred.
+
+In that additive form the stress and the fabric compete for the same density,
+and a concentrated fabric wins: on the Cushing catalog ``w`` falls to 0.07 and
+the plane selection is the fabric's alone.  ``fabric_mode='product'`` instead
+lets faults exist according to the fabric and reactivate according to the
+stress,
+
+    g_prod(n) = g(I(n)) h(n),    Z(theta) = E_n[ g(I(n)) h(n) ],
+
+so both terms act on every fault.  ``Z`` then depends on the fabric axes
+relative to the stress frame and is not tabulated; it is a quasi-Monte Carlo
+average over ``2**product_qmc_power`` fixed Sobol normals inside the graph.
 """
 from __future__ import annotations
 
@@ -62,6 +74,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
+import pymc as pm
 import pytensor.tensor as pt
 
 __all__ = [
@@ -84,6 +97,7 @@ _DEFAULT_MU_POINTS = 81
 _DEFAULT_IMIN_POINTS = 34
 _DEFAULT_IMIN_MAX = 0.99
 _DEFAULT_POWER = 16
+_DEFAULT_PRODUCT_POWER = 10   # Sobol normals for the in-graph product normalizer
 _DEFAULT_SEED = 20260916
 _DEFAULT_RAMP_K = 100.0
 # Bump when the definition of any population weight changes, so that cached
@@ -147,8 +161,14 @@ def resolve_population_spec(
         "fabric_family": str(spec.get("fabric_family", "watson")).strip().lower(),
         "fabric_kappa_sigma": float(spec.get("fabric_kappa_sigma", 40.0)),
         "fabric_pi_alpha": float(spec.get("fabric_pi_alpha", 1.0)),
+        "fabric_mode": str(spec.get("fabric_mode", "additive")).strip().lower(),
+        "product_qmc_power": int(spec.get("product_qmc_power", _DEFAULT_PRODUCT_POWER)),
         "table": dict(spec.get("table", {})),
     }
+    if out["fabric_mode"] not in {"additive", "product"}:
+        raise ValueError("fabric_mode must be 'additive' or 'product'")
+    if out["fabric_mode"] == "product" and out["fabric_K"] < 1:
+        raise ValueError("fabric_mode='product' requires fabric_K >= 1")
     if out["fabric_K"] < 0:
         raise ValueError("fabric_K must be >= 0")
     if out["fabric_family"] not in {"watson", "bingham"}:
@@ -157,6 +177,8 @@ def resolve_population_spec(
         raise ValueError("fabric_pi_alpha must be > 0")
     if out["mix_uniform"] and out["fabric_K"] > 0:
         raise ValueError("Use either mix_uniform or fabric_K, not both")
+    if out["fabric_mode"] == "product" and not out["normalize"]:
+        raise ValueError("fabric_mode='product' is only defined with normalize=True")
 
     if family == "exp":
         out["beta"] = float(spec.get("beta", selection_beta))
@@ -377,6 +399,53 @@ def log_watson_mixture_pt(n, axes, kappa, log_pi, n_quad: int = 48):
                           axis=1))
     cos2 = pt.dot(n, axes.T) ** 2
     return pt.logsumexp(log_pi[None, :] + kappa[None, :] * cos2 - log_M[None, :], axis=1)
+
+
+def gnomonic_rotation(name: str, shape, initval=None):
+    """Uniform (Haar) random rotations in a three-parameter chart.
+
+    A unit quaternion ``q = (1, v) / sqrt(1 + |v|^2)`` with ``v`` in R^3 covers
+    every rotation once (``q`` and ``-q`` are the same rotation), and the Haar
+    measure pulled back to ``v`` is the trivariate Cauchy density
+    ``p(v) = (1 + |v|^2)^-2 / pi^2``.  Compared with normalizing a Gaussian
+    4-vector this has no free radial direction, so when the data pin the
+    rotation to a fraction of a degree the posterior is a small blob in ``v``
+    rather than a needle along a ray, and NUTS steps at the natural scale
+    instead of at the needle's width.  Rotations by 180 degrees from the
+    identity sit at infinity, but every stress or fabric frame has symmetric
+    copies (sign of each axis) of which one lies within ``|v| <= sqrt(3)``.
+
+    Returns ``(quaternions, v)`` with ``quaternions`` of shape ``shape + (4,)``.
+    ``shape`` is ``()`` or ``(K,)``.
+    """
+    v = pm.Normal(f"{name}_gnomonic", mu=0.0, sigma=1.0, shape=tuple(shape) + (3,),
+                  initval=initval)
+    r2 = pt.sum(v ** 2, axis=-1)
+    # Replace the Gaussian density by the Cauchy pull-back of the Haar measure.
+    pm.Potential(f"{name}_haar", pt.sum(0.5 * r2 - 2.0 * pt.log1p(r2)))
+    scale = 1.0 / pt.sqrt(1.0 + r2)
+    q = pt.concatenate([scale[..., None], v * scale[..., None]], axis=-1)
+    return q, v
+
+
+def gnomonic_initval(quaternions: np.ndarray) -> np.ndarray:
+    """Chart coordinates of unit quaternions, using the symmetric copy nearest the identity."""
+    q = np.asarray(quaternions, float)
+    q = q / np.linalg.norm(q, axis=-1, keepdims=True)
+    # Right-multiplying by the unit quaternions 1, i, j, k permutes the components
+    # (with signs), so moving the largest component to the front is a symmetric copy.
+    out = np.empty(q.shape[:-1] + (3,))
+    for idx in np.ndindex(q.shape[:-1]):
+        qi = q[idx]
+        k = int(np.argmax(np.abs(qi)))
+        if k != 0:
+            table = {1: (1, 0, 3, 2), 2: (2, 3, 0, 1), 3: (3, 2, 1, 0)}[k]
+            signs = {1: (-1, 1, 1, -1), 2: (-1, -1, 1, 1), 3: (-1, 1, -1, 1)}[k]
+            qi = np.array([sg * qi[j] for sg, j in zip(signs, table)])
+        if qi[0] < 0:
+            qi = -qi
+        out[idx] = qi[1:] / qi[0]
+    return out
 
 
 def quat_to_rotation_pt(q):

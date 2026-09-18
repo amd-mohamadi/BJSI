@@ -360,7 +360,7 @@ def _build_joint_model(
                 "A fault population requires the joint two-plane mixture; it cannot be "
                 "combined with iterative preselection or externally fixed plane labels"
             )
-        if pop_spec["normalize"]:
+        if pop_spec["normalize"] and pop_spec.get("fabric_mode") != "product":
             pop_spec["_table"] = _fp.normalizer_table(pop_spec)
 
     with pm.Model() as model:
@@ -369,12 +369,22 @@ def _build_joint_model(
                 mechanism_angles, mechanism_errors, n1, s1, n2, s2,
             )
         # --- Stress orientation as unit quaternion ---
-        if q_prior_mu_arr is not None:
-            q_raw = pm.Normal("q_raw", mu=q_prior_mu_arr, sigma=q_prior_sigma, shape=4)
+        if pop_spec["family"] != _fp.LEGACY and q_prior_mu_arr is None:
+            # Population models pin the orientation to a fraction of a degree;
+            # a normalized Gaussian 4-vector then has a free radial direction
+            # 20-100 times wider than the rotational ones and NUTS steps at the
+            # narrow scale (tree depth at its cap).  The gnomonic chart has the
+            # same Haar prior with no radial direction.  The legacy path keeps
+            # its parameterization so that its results are reproducible.
+            q, _ = _fp.gnomonic_rotation("q", ())
+            pm.Deterministic("q_unit", q)
         else:
-            q_raw = pm.Normal("q_raw", mu=0.0, sigma=1.0, shape=4)
-        q_norm = pt.sqrt(pt.sum(pt.square(q_raw))) + 1e-8
-        q = q_raw / q_norm
+            if q_prior_mu_arr is not None:
+                q_raw = pm.Normal("q_raw", mu=q_prior_mu_arr, sigma=q_prior_sigma, shape=4)
+            else:
+                q_raw = pm.Normal("q_raw", mu=0.0, sigma=1.0, shape=4)
+            q_norm = pt.sqrt(pt.sum(pt.square(q_raw))) + 1e-8
+            q = q_raw / q_norm
         Rmat = pm.Deterministic("R_matrix", quat_to_rotation_matrix(q))
 
         # --- Shape ratio R ∈ (0,1) ---
@@ -554,8 +564,10 @@ def _build_joint_model(
                 log_g2 = _fp.log_population_weight_pt(inst2, pop_spec, imin_var)
 
                 mix_weight = None
+                product_fabric = pop_spec["fabric_K"] > 0 and pop_spec["fabric_mode"] == "product"
                 if pop_spec["mix_uniform"] or pop_spec["fabric_K"] > 0:
-                    mix_weight = pm.Uniform("w_population", lower=0.0, upper=1.0)
+                    if not product_fabric:
+                        mix_weight = pm.Uniform("w_population", lower=0.0, upper=1.0)
                     if pop_spec["fabric_K"] > 0:
                         K = int(pop_spec["fabric_K"])
                         rng_init = np.random.default_rng(0)
@@ -571,11 +583,10 @@ def _build_joint_model(
                             # axes, and two concentrations against the first two of
                             # them. Equal concentrations reproduce a Watson
                             # component; one large and one near zero give a girdle.
-                            quat_raw = pm.Normal(
-                                "fabric_quat_raw", mu=0.0, sigma=1.0, shape=(K, 4),
-                                initval=rng_init.normal(size=(K, 4)),
+                            quats, _ = _fp.gnomonic_rotation(
+                                "fabric_quat", (K,),
+                                initval=_fp.gnomonic_initval(rng_init.normal(size=(K, 4))),
                             )
-                            quats = quat_raw / pt.sqrt(pt.sum(quat_raw ** 2, axis=1, keepdims=True) + 1e-9)
                             axes = pt.stack([_fp.quat_to_rotation_pt(quats[k]) for k in range(K)])
                             pm.Deterministic("fabric_axes", axes)
                             fabric_kappa = pm.HalfNormal(
@@ -585,11 +596,15 @@ def _build_joint_model(
                             log_h1 = _fp.log_bingham_mixture_pt(n1, axes, fabric_kappa, log_pi)
                             log_h2 = _fp.log_bingham_mixture_pt(n2, axes, fabric_kappa, log_pi)
                         else:
-                            axis_raw = pm.Normal(
-                                "fabric_axis_raw", mu=0.0, sigma=1.0, shape=(K, 3),
-                                initval=rng_init.normal(size=(K, 3)),
+                            # A Watson axis is the third column of a uniformly
+                            # random rotation (its marginal is uniform on the
+                            # sphere); the rotation about the axis is a flat,
+                            # harmless direction.  Same chart as the Bingham case.
+                            quats, _ = _fp.gnomonic_rotation(
+                                "fabric_quat", (K,),
+                                initval=_fp.gnomonic_initval(rng_init.normal(size=(K, 4))),
                             )
-                            axes = axis_raw / pt.sqrt(pt.sum(axis_raw ** 2, axis=1, keepdims=True) + 1e-9)
+                            axes = pt.stack([_fp.quat_to_rotation_pt(quats[k])[:, 2] for k in range(K)])
                             pm.Deterministic("fabric_axes", axes)
                             fabric_kappa = pm.HalfNormal(
                                 "fabric_kappa", sigma=float(pop_spec["fabric_kappa_sigma"]), shape=K,
@@ -599,10 +614,17 @@ def _build_joint_model(
                     else:
                         log_h1 = pt.zeros_like(log_g1)
                         log_h2 = pt.zeros_like(log_g2)
-                    log_w = pt.log(pt.clip(mix_weight, eps, 1.0 - eps))
-                    log_1mw = pt.log1p(-pt.clip(mix_weight, eps, 1.0 - eps))
-                    log_g1 = pt.logaddexp(log_w + log_g1, log_1mw + log_h1)
-                    log_g2 = pt.logaddexp(log_w + log_g2, log_1mw + log_h2)
+                    if product_fabric:
+                        # Faults exist per the fabric and reactivate per the
+                        # stress: g(I(n)) h(n), normalized below by quasi-Monte
+                        # Carlo because Z couples the fabric axes to the frame.
+                        log_g1 = log_g1 + log_h1
+                        log_g2 = log_g2 + log_h2
+                    else:
+                        log_w = pt.log(pt.clip(mix_weight, eps, 1.0 - eps))
+                        log_1mw = pt.log1p(-pt.clip(mix_weight, eps, 1.0 - eps))
+                        log_g1 = pt.logaddexp(log_w + log_g1, log_1mw + log_h1)
+                        log_g2 = pt.logaddexp(log_w + log_g2, log_1mw + log_h2)
 
                 # Prior plane probability implied by the population.
                 log_gsum = pt.logaddexp(log_g1, log_g2)
@@ -613,7 +635,21 @@ def _build_joint_model(
                 logmix = pt.logaddexp(logw1, logw2)
                 pm.Potential("likelihood", pt.sum(logmix))
 
-                if pop_spec["normalize"]:
+                if pop_spec["normalize"] and product_fabric:
+                    n_qmc = _fp.sobol_unit_normals(
+                        pop_spec["product_qmc_power"], pop_spec["table"]["seed"]
+                    )
+                    n_qmc_t = pt.as_tensor_variable(n_qmc)
+                    inst_q = instability_parameter_log(Sigma, n_qmc_t, mu, Rratio)
+                    log_gq = _fp.log_population_weight_pt(inst_q, pop_spec, imin_var)
+                    if pop_spec["fabric_family"] == "bingham":
+                        log_hq = _fp.log_bingham_mixture_pt(n_qmc_t, axes, fabric_kappa, log_pi)
+                    else:
+                        log_hq = _fp.log_watson_mixture_pt(n_qmc_t, axes, fabric_kappa, log_pi)
+                    log_Z = pt.logsumexp(log_gq + log_hq) - np.log(float(n_qmc.shape[0]))
+                    pm.Deterministic("log_Z_population", log_Z)
+                    pm.Potential("population_normalizer", -float(n_events_total) * log_Z)
+                elif pop_spec["normalize"]:
                     log_Z = _fp.interp_normalizer_pt(
                         pop_spec["_table"], Rratio, mu, imin_var
                     )
@@ -700,6 +736,139 @@ def _build_joint_model(
                 pm.Potential("shear_const_penalty", -sw * pen)
 
     return model, mu_const
+
+
+
+def summarize_posterior(idata, hdi_prob: float = 0.9) -> Dict[str, Any]:
+    """Posterior summaries of a NUTS ``InferenceData`` used by the output tools.
+
+    Every chain in ``idata`` is pooled.  Population models are multimodal on
+    real catalogs, and a pooled element-wise median then mixes basins, so the
+    per-basin outputs are produced by calling this on ``idata.sel(chain=...)``
+    (see ``basins.subset_results``).  The keys mirror the sampler result:
+    ``stress_tensor`` (element-wise median, normalized to unit largest
+    eigenvalue), ``principal_*``, ``R_*``, ``posterior_principal_*``,
+    ``hdi``/``hdi_90``, ``plane_probabilities`` and ``plane_selection_map``
+    (mean plane-2 probability over draws, thresholded at one half), and the
+    friction and ``tau0`` statistics when those were sampled.
+    """
+    R_samples = idata.posterior["R"].stack(s=("chain", "draw")).values
+    Sigma_samples_raw = idata.posterior["Sigma"].stack(s=("chain", "draw")).values  # (3, 3, S)
+    mu_samples = None
+    if "mu" in idata.posterior:
+        mu_samples = idata.posterior["mu"].stack(s=("chain", "draw")).values
+    tau0_samples = None
+    if "tau0" in idata.posterior:
+        tau0_samples = idata.posterior["tau0"].stack(s=("chain", "draw")).values
+
+    def _hdi_1d(arr):
+        arr = np.asarray(arr).reshape(-1)
+        if arr.size == 0:
+            return None
+        try:
+            h = az.hdi(arr, hdi_prob=hdi_prob)
+            h = np.asarray(h).reshape(-1)
+            if h.size >= 2:
+                return (float(h[0]), float(h[1]))
+        except Exception:
+            pass
+        return None
+
+    R_median = float(np.median(R_samples))
+    R_mean = float(np.mean(R_samples))
+    R_std = float(np.std(R_samples))
+    R_CI95 = (float(np.quantile(R_samples, 0.025)), float(np.quantile(R_samples, 0.975)))
+
+    Sigma_samples = np.empty_like(Sigma_samples_raw)
+    for i in range(Sigma_samples.shape[2]):
+        Sigma_i = Sigma_samples_raw[:, :, i]
+        norm_i = np.max(np.abs(np.linalg.eigvalsh(Sigma_i)))
+        Sigma_samples[:, :, i] = Sigma_i / (norm_i if norm_i > 0 else 1.0)
+
+    sigma_stack = np.moveaxis(Sigma_samples, 2, 0)  # (S, 3, 3) for HDI
+    Sigma_hdi = None
+    try:
+        Sigma_hdi = np.full((3, 3, 2), np.nan, dtype=float)
+        for i in range(3):
+            for j in range(3):
+                h_ij = _hdi_1d(sigma_stack[:, i, j])
+                if h_ij is not None:
+                    Sigma_hdi[i, j, 0] = h_ij[0]
+                    Sigma_hdi[i, j, 1] = h_ij[1]
+    except Exception:
+        Sigma_hdi = None
+
+    R_hdi = _hdi_1d(R_samples)
+    mu_hdi = _hdi_1d(mu_samples) if mu_samples is not None else None
+    tau0_hdi = _hdi_1d(tau0_samples) if tau0_samples is not None else None
+
+    Sigma_median = np.median(Sigma_samples, axis=2)
+    norm = np.max(np.abs(np.linalg.eigvalsh(Sigma_median)))
+    Sigma_median = Sigma_median / (norm if norm > 0 else 1.0)
+
+    ps_median, pd_median = stress_tensor_eigendecomposition(Sigma_median)
+
+    n_boot = Sigma_samples.shape[2]
+    boot_ps = np.zeros((n_boot, 3), dtype=np.float64)
+    boot_pd = np.zeros((n_boot, 3, 3), dtype=np.float64)
+    for i in range(n_boot):
+        ps_i, pd_i = stress_tensor_eigendecomposition(Sigma_samples[:, :, i])
+        boot_ps[i, :] = ps_i
+        boot_pd[i, :, :] = pd_i
+
+    results: Dict[str, Any] = {
+        "stress_tensor": Sigma_median,
+        "principal_stresses": ps_median,
+        "principal_directions": pd_median,
+        "R_median": R_median,
+        "R_mean": R_mean,
+        "R_std": R_std,
+        "R_CI95": R_CI95,
+        "idata": idata,
+        "posterior_principal_stresses": boot_ps,
+        "posterior_principal_directions": boot_pd,
+        "R_posterior": R_samples,
+        "mu_samples": mu_samples,
+        "tau0_samples": tau0_samples,
+    }
+    hdi_info = {
+        "prob": float(hdi_prob),
+        "R": R_hdi,
+        "mu": mu_hdi,
+        "tau0": tau0_hdi,
+        "Sigma": Sigma_hdi,
+        "stress_tensor": Sigma_hdi,
+    }
+    results["hdi"] = hdi_info
+    if abs(float(hdi_prob) - 0.9) < 1e-6:
+        results["hdi_90"] = hdi_info
+
+    if "p_plane2_post" in idata.posterior:
+        p2_s = idata.posterior["p_plane2_post"].stack(s=("chain", "draw")).values  # (N, S)
+        plane_2_prob = np.mean(p2_s, axis=1)
+        plane_1_prob = 1.0 - plane_2_prob
+        results["plane_probabilities"] = np.stack([plane_1_prob, plane_2_prob], axis=1)
+        results["plane_selection_map"] = (plane_2_prob > 0.5).astype(int)
+
+    if mu_samples is not None and mu_samples.size > 0:
+        results["friction_median"] = float(np.median(mu_samples))
+        results["friction_mean"] = float(np.mean(mu_samples))
+        results["friction_coefficient"] = float(np.mean(mu_samples))
+        results["mu"] = float(np.median(mu_samples))
+        results["friction_std"] = float(np.std(mu_samples))
+        results["friction_CI95"] = (
+            float(np.quantile(mu_samples, 0.025)),
+            float(np.quantile(mu_samples, 0.975)),
+        )
+    if tau0_samples is not None and tau0_samples.size > 0:
+        results["tau0_median"] = float(np.median(tau0_samples))
+        results["tau0_mean"] = float(np.mean(tau0_samples))
+        results["tau0_std"] = float(np.std(tau0_samples))
+        results["tau0_CI95"] = (
+            float(np.quantile(tau0_samples, 0.025)),
+            float(np.quantile(tau0_samples, 0.975)),
+        )
+    return results
 
 
 def _population_results(idata, fault_population) -> Optional[Dict[str, Any]]:
@@ -1852,8 +2021,20 @@ def Bayesian_joint_plane_selection_NUTS(
             raise ValueError("Explicit initvals require the PyMC NUTS backend (nuts_sampler='pymc')")
         sampler_kwargs["initvals"] = initvals
         sampler_kwargs["init"] = "adapt_diag"
+    smc_info = None
     with model:
-        if sampler_name in {"nutpie", "nuts-nutpie"}:
+        if sampler_name in {"smc", "blackjax_smc"}:
+            # Adaptive tempered SMC on the same model graph; ``draws`` is the
+            # number of particles and ``chains`` the number of independent runs.
+            try:
+                from . import bjsi_smc as _smc
+            except ImportError:
+                import bjsi_smc as _smc
+            idata, smc_info = _smc.sample_smc(
+                model, draws=draws, chains=chains, cores=cores, random_seed=random_seed,
+                progressbar=progressbar, **nk,
+            )
+        elif sampler_name in {"nutpie", "nuts-nutpie"}:
             idata = pm.sample(nuts_sampler="nutpie", nuts_sampler_kwargs=nk, **sampler_kwargs)
         elif sampler_name in {"numpyro", "jax"}:
             # NumPyro backend runs on CPU here; chain_method can be "vectorized"/"parallel"/"sequential"
@@ -1864,99 +2045,11 @@ def Bayesian_joint_plane_selection_NUTS(
             idata = pm.sample(**sampler_kwargs)
 
     # --- Post-processing (mirror SMC outputs) ---
-    R_samples = idata.posterior["R"].stack(s=("chain", "draw")).values
-    Sigma_samples_raw = idata.posterior["Sigma"].stack(s=("chain", "draw")).values  # (3, 3, S)
-    mu_samples = None
-    if "mu" in idata.posterior:
-        mu_samples = idata.posterior["mu"].stack(s=("chain", "draw")).values
-    tau0_samples = None
-    if "tau0" in idata.posterior:
-        tau0_samples = idata.posterior["tau0"].stack(s=("chain", "draw")).values
-
-    def _hdi_1d(arr):
-        arr = np.asarray(arr).reshape(-1)
-        if arr.size == 0:
-            return None
-        try:
-            h = az.hdi(arr, hdi_prob=hdi_prob)
-            h = np.asarray(h).reshape(-1)
-            if h.size >= 2:
-                return (float(h[0]), float(h[1]))
-        except Exception:
-            pass
-        return None
-
-    R_median = float(np.median(R_samples))
-    R_mean = float(np.mean(R_samples))
-    R_std = float(np.std(R_samples))
-    R_CI95 = (float(np.quantile(R_samples, 0.025)), float(np.quantile(R_samples, 0.975)))
-
-    Sigma_samples = np.empty_like(Sigma_samples_raw)
-    for i in range(Sigma_samples.shape[2]):
-        Sigma_i = Sigma_samples_raw[:, :, i]
-        norm_i = np.max(np.abs(np.linalg.eigvalsh(Sigma_i)))
-        Sigma_samples[:, :, i] = Sigma_i / (norm_i if norm_i > 0 else 1.0)
-
-    sigma_stack = np.moveaxis(Sigma_samples, 2, 0)  # (S, 3, 3) for HDI
-    Sigma_hdi = None
-    try:
-        Sigma_hdi = np.full((3, 3, 2), np.nan, dtype=float)
-        for i in range(3):
-            for j in range(3):
-                h_ij = _hdi_1d(sigma_stack[:, i, j])
-                if h_ij is not None:
-                    Sigma_hdi[i, j, 0] = h_ij[0]
-                    Sigma_hdi[i, j, 1] = h_ij[1]
-    except Exception:
-        Sigma_hdi = None
-
-    R_hdi = _hdi_1d(R_samples)
-    mu_hdi = _hdi_1d(mu_samples) if mu_samples is not None else None
-    tau0_hdi = _hdi_1d(tau0_samples) if tau0_samples is not None else None
-
-    Sigma_median = np.median(Sigma_samples, axis=2)
-    norm = np.max(np.abs(np.linalg.eigvalsh(Sigma_median)))
-    Sigma_median = Sigma_median / (norm if norm > 0 else 1.0)
-
-    ps_median, pd_median = stress_tensor_eigendecomposition(Sigma_median)
-
-    n_boot = Sigma_samples.shape[2]
-    boot_ps = np.zeros((n_boot, 3), dtype=np.float64)
-    boot_pd = np.zeros((n_boot, 3, 3), dtype=np.float64)
-    for i in range(n_boot):
-        Sigma_i = Sigma_samples[:, :, i]
-        norm_i = np.max(np.abs(np.linalg.eigvalsh(Sigma_i)))
-        Sigma_i = Sigma_i / (norm_i if norm_i > 0 else 1.0)
-        ps_i, pd_i = stress_tensor_eigendecomposition(Sigma_i)
-        boot_ps[i, :] = ps_i
-        boot_pd[i, :, :] = pd_i
-
-    results: Dict[str, Any] = {
-        "stress_tensor": Sigma_median,
-        "principal_stresses": ps_median,
-        "principal_directions": pd_median,
-        "R_median": R_median,
-        "R_mean": R_mean,
-        "R_std": R_std,
-        "R_CI95": R_CI95,
-        "idata": idata,
-        "posterior_principal_stresses": boot_ps,
-        "posterior_principal_directions": boot_pd,
-        "R_posterior": R_samples,
-        "mu_samples": mu_samples,
-        "tau0_samples": tau0_samples,
-    }
-    hdi_info = {
-        "prob": float(hdi_prob),
-        "R": R_hdi,
-        "mu": mu_hdi,
-        "tau0": tau0_hdi,
-        "Sigma": Sigma_hdi,
-        "stress_tensor": Sigma_hdi,
-    }
-    results["hdi"] = hdi_info
-    if abs(float(hdi_prob) - 0.9) < 1e-6:
-        results["hdi_90"] = hdi_info
+    results: Dict[str, Any] = summarize_posterior(idata, hdi_prob=hdi_prob)
+    R_median = results["R_median"]
+    pd_median = results["principal_directions"]
+    mu_samples = results["mu_samples"]
+    tau0_samples = results["tau0_samples"]
 
     results["mechanism_sigma_deg"] = mechanism_errors.copy()
     results["fixed_plane_indices"] = None if fixed_plane_indices is None else fixed_plane_indices.copy()
@@ -1966,16 +2059,8 @@ def Bayesian_joint_plane_selection_NUTS(
         if iterative_plane_selection:
             results["plane_probabilities"] = iterative_info.get("plane_probabilities")
             results["plane_selection_map"] = iterative_info.get("plane_map")
-        else:
-            if "p_plane2_post" not in idata.posterior:
-                raise RuntimeError("Internal error: p_plane2_post missing from posterior")
-            p2_s = idata.posterior["p_plane2_post"].stack(s=("chain", "draw")).values  # (N, S)
-            plane_2_prob = np.mean(p2_s, axis=1)
-            plane_1_prob = 1.0 - plane_2_prob
-            plane_probabilities = np.stack([plane_1_prob, plane_2_prob], axis=1)
-            plane_selection_map = (plane_2_prob > 0.5).astype(int)
-            results["plane_probabilities"] = plane_probabilities
-            results["plane_selection_map"] = plane_selection_map
+        elif "plane_probabilities" not in results:
+            raise RuntimeError("Internal error: p_plane2_post missing from posterior")
 
     if iterative_plane_selection:
         results["friction_coefficient"] = None
@@ -2013,29 +2098,18 @@ def Bayesian_joint_plane_selection_NUTS(
             results["hdi"]["mu"] = (float(mu_hat), float(mu_hat))
             if "hdi_90" in results:
                 results["hdi_90"]["mu"] = (float(mu_hat), float(mu_hat))
-    else:
-        if mu_samples is not None and mu_samples.size > 0:
-            results["friction_median"] = float(np.median(mu_samples))
-            results["friction_mean"] = float(np.mean(mu_samples))
-            results["friction_coefficient"] = float(np.mean(mu_samples))
-            results["mu"] = float(np.median(mu_samples))
-            results["friction_std"] = float(np.std(mu_samples))
-            results["friction_CI95"] = (
-                float(np.quantile(mu_samples, 0.025)),
-                float(np.quantile(mu_samples, 0.975)),
-            )
-        else:
-            mu_fixed = (
-                float(mu_const)
-                if mu_const is not None
-                else 0.5 * (float(friction_range[0]) + float(friction_range[1]))
-            )
-            results["friction_coefficient"] = mu_fixed
-            results["mu"] = mu_fixed
-            results["friction_median"] = mu_fixed
-            results["friction_mean"] = mu_fixed
-            results["friction_std"] = 0.0
-            results["friction_CI95"] = (mu_fixed, mu_fixed)
+    elif mu_samples is None or mu_samples.size == 0:
+        mu_fixed = (
+            float(mu_const)
+            if mu_const is not None
+            else 0.5 * (float(friction_range[0]) + float(friction_range[1]))
+        )
+        results["friction_coefficient"] = mu_fixed
+        results["mu"] = mu_fixed
+        results["friction_median"] = mu_fixed
+        results["friction_mean"] = mu_fixed
+        results["friction_std"] = 0.0
+        results["friction_CI95"] = (mu_fixed, mu_fixed)
 
     results["convergence"] = {
         "n_samples": draws * chains,
@@ -2045,15 +2119,15 @@ def Bayesian_joint_plane_selection_NUTS(
         "target_accept": target_accept,
         "tune": tune,
     }
-
-    if tau0_samples is not None and tau0_samples.size > 0:
-        results["tau0_median"] = float(np.median(tau0_samples))
-        results["tau0_mean"] = float(np.mean(tau0_samples))
-        results["tau0_std"] = float(np.std(tau0_samples))
-        results["tau0_CI95"] = (
-            float(np.quantile(tau0_samples, 0.025)),
-            float(np.quantile(tau0_samples, 0.975)),
-        )
+    if smc_info is not None:
+        results["convergence"].update({
+            "sampler": "SMC", "nuts_sampler": "blackjax_smc", "target_accept": None, "tune": None,
+            "kernel": smc_info["kernel"], "log_evidence": smc_info["log_evidence"],
+            "n_iterations": smc_info["n_iterations"],
+        })
+        results["smc"] = smc_info
+        if results.get("fault_population") is not None:
+            results["fault_population"]["log_evidence"] = smc_info["log_evidence"]
 
     if iterative_plane_selection:
         mu_sel = iterative_info.get("mu")
