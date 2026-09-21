@@ -62,6 +62,26 @@ stress,
 so both terms act on every fault.  ``Z`` then depends on the fabric axes
 relative to the stress frame and is not tabulated; it is a quasi-Monte Carlo
 average over ``2**product_qmc_power`` fixed Sobol normals inside the graph.
+
+Related families
+----------------
+With ``K > 1`` a spare component is free to adopt any sub-population of
+normals, including one that the nodal-plane ambiguity manufactures: at Cushing
+23 mechanisms whose second planes lie in the main girdle get a component of
+their own on their steep first planes.  ``fabric_min_overlap`` requires every
+other component to overlap the dominant one (largest weight) by at least that
+much, where the overlap of two components is the Bhattacharyya coefficient
+
+    O_kl = E_n[ sqrt(B_k(n) B_l(n)) ],
+
+one for identical components and near zero for components with disjoint
+support, evaluated on the same Sobol normals as the product normalizer.  A
+secondary component can then only be a rotation, splay or sharper core of the
+main family, not an unrelated set.  The constraint is a soft penalty
+``-fabric_overlap_strength * max(0, O_min - O)**2`` per component, tempered
+with the data by the SMC sampler; the log evidence it reports therefore
+includes the prior mass of the admissible region, whose logarithm
+:func:`overlap_prior_log_norm` estimates so that it can be removed.
 """
 from __future__ import annotations
 
@@ -78,8 +98,14 @@ import pymc as pm
 import pytensor.tensor as pt
 
 __all__ = [
+    "DEFAULT_FAULT_POPULATION",
     "resolve_population_spec",
     "log_bingham_mixture_pt",
+    "log_bingham_components_pt",
+    "log_watson_components_pt",
+    "component_overlap_pt",
+    "overlap_penalty_pt",
+    "overlap_prior_log_norm",
     "instability_numpy",
     "instability_pt",
     "log_population_weight_pt",
@@ -100,6 +126,20 @@ _DEFAULT_POWER = 16
 _DEFAULT_PRODUCT_POWER = 10   # Sobol normals for the in-graph product normalizer
 _DEFAULT_SEED = 20260916
 _DEFAULT_RAMP_K = 100.0
+
+# Default population: the stress-selected ramp with inferred I_min and one
+# Bingham fabric component (K = 1).  Extra components must overlap the main
+# one by at least 0.2 (Bhattacharyya) so that K > 1 stays a perturbation of
+# one fault family.  ``fault_population=None`` still selects the legacy model.
+DEFAULT_FAULT_POPULATION: Dict[str, Any] = {
+    "family": "ramp",
+    "imin": "infer",
+    "fabric_K": 1,
+    "fabric_family": "bingham",
+    "fabric_pi_alpha": 1.0,
+    "fabric_min_overlap": 0.2,
+    "fabric_overlap_strength": 2000.0,
+}
 # Bump when the definition of any population weight changes, so that cached
 # normalizer tables built with an earlier definition are not reused.
 _TABLE_VERSION = 2
@@ -118,7 +158,11 @@ def resolve_population_spec(
     """Return a fully populated specification dictionary.
 
     ``fault_population`` may be ``None`` or ``"legacy"`` for the historical
-    unnormalized mixture, a family name, or a dictionary with the keys below.
+    unnormalized mixture, ``"default"`` for :data:`DEFAULT_FAULT_POPULATION`,
+    a family name, or a dictionary with the keys below.
+    Missing keys take the values of :data:`DEFAULT_FAULT_POPULATION`: a ramp
+    with inferred ``imin``, one Bingham fabric component, ``fabric_pi_alpha``
+    1 and a minimum overlap of 0.2 enforced with strength 2000.
 
     family : {'legacy', 'exp', 'ramp'}
     beta : float, for the 'exp' family; defaults to the model's selection beta
@@ -127,15 +171,23 @@ def resolve_population_spec(
     k : float, sharpness of the ramp softplus
     normalize : bool, add the ``-N log Z`` potential
     mix_uniform : bool, add a uniform component with inferred weight
-    fabric_K : int, number of fabric clusters, 0 to disable
+    fabric_K : int, number of fabric clusters (default 1 for 'ramp', 0 for
+        'exp'), 0 to disable
     fabric_family : {'watson', 'bingham'}, shape of one fabric component
+        (default 'bingham')
     fabric_kappa_sigma : float, half-normal prior scale for the concentrations
     fabric_pi_alpha : float, Dirichlet concentration on the fabric proportions;
         values below one favour switching components off
+    fabric_min_overlap : float in [0, 1), minimum Bhattacharyya overlap of
+        every extra component with the dominant one (default 0.2), 0 to disable
+    fabric_overlap_strength : float, stiffness of the overlap penalty
+        (default 2000)
     table : dict, overrides for the normalizer grid and sampling
     """
     if fault_population is None:
         spec: Dict[str, Any] = {"family": LEGACY}
+    elif isinstance(fault_population, str) and fault_population.strip().lower() == "default":
+        spec = dict(DEFAULT_FAULT_POPULATION)
     elif isinstance(fault_population, str):
         spec = {"family": fault_population.strip().lower()}
     elif isinstance(fault_population, dict):
@@ -153,22 +205,32 @@ def resolve_population_spec(
     if family == LEGACY:
         return {"family": LEGACY, "normalize": False, "mix_uniform": False, "fabric_K": 0}
 
+    _D = DEFAULT_FAULT_POPULATION
     out: Dict[str, Any] = {
         "family": family,
         "normalize": bool(spec.get("normalize", True)),
         "mix_uniform": bool(spec.get("mix_uniform", False)),
-        "fabric_K": int(spec.get("fabric_k", spec.get("fabric_K", 0))),
-        "fabric_family": str(spec.get("fabric_family", "watson")).strip().lower(),
+        # The default fabric belongs to the ramp model; 'exp' and the uniform
+        # mixture stay purely stress-selected.
+        "fabric_K": int(spec.get("fabric_k", spec.get(
+            "fabric_K", _D["fabric_K"] if family == "ramp" and not spec.get("mix_uniform", False) else 0))),
+        "fabric_family": str(spec.get("fabric_family", _D["fabric_family"])).strip().lower(),
         "fabric_kappa_sigma": float(spec.get("fabric_kappa_sigma", 40.0)),
-        "fabric_pi_alpha": float(spec.get("fabric_pi_alpha", 1.0)),
+        "fabric_pi_alpha": float(spec.get("fabric_pi_alpha", _D["fabric_pi_alpha"])),
         "fabric_mode": str(spec.get("fabric_mode", "additive")).strip().lower(),
         "product_qmc_power": int(spec.get("product_qmc_power", _DEFAULT_PRODUCT_POWER)),
+        "fabric_min_overlap": float(spec.get("fabric_min_overlap", _D["fabric_min_overlap"])),
+        "fabric_overlap_strength": float(spec.get("fabric_overlap_strength", _D["fabric_overlap_strength"])),
         "table": dict(spec.get("table", {})),
     }
     if out["fabric_mode"] not in {"additive", "product"}:
         raise ValueError("fabric_mode must be 'additive' or 'product'")
     if out["fabric_mode"] == "product" and out["fabric_K"] < 1:
         raise ValueError("fabric_mode='product' requires fabric_K >= 1")
+    if not 0.0 <= out["fabric_min_overlap"] < 1.0:
+        raise ValueError("fabric_min_overlap must lie in [0, 1)")
+    if out["fabric_overlap_strength"] < 0.0:
+        raise ValueError("fabric_overlap_strength must be >= 0")
     if out["fabric_K"] < 0:
         raise ValueError("fabric_K must be >= 0")
     if out["fabric_family"] not in {"watson", "bingham"}:
@@ -502,6 +564,112 @@ def log_bingham_mixture_pt(n, axes, kappas, log_pi, n_quad: int = 64):
     quad = -(kappas[None, :, 0] * cos2[:, :, 0] + kappas[None, :, 1] * cos2[:, :, 1])
     log_c = _log_bingham_normalizer_pt(kappas[:, 0], kappas[:, 1], n_quad)
     return pt.logsumexp(log_pi[None, :] + quad - log_c[None, :], axis=1)
+
+
+def log_bingham_components_pt(n, axes, kappas, n_quad: int = 64):
+    """Per-component log density ``(N, K)`` of :func:`log_bingham_mixture_pt`, without weights."""
+    cos2 = pt.tensordot(n, axes, axes=[[1], [1]]) ** 2
+    quad = -(kappas[None, :, 0] * cos2[:, :, 0] + kappas[None, :, 1] * cos2[:, :, 1])
+    return quad - _log_bingham_normalizer_pt(kappas[:, 0], kappas[:, 1], n_quad)[None, :]
+
+
+def log_watson_components_pt(n, axes, kappa, n_quad: int = 48):
+    """Per-component log density ``(N, K)`` of :func:`log_watson_mixture_pt`, without weights."""
+    nodes, weights = np.polynomial.legendre.leggauss(int(n_quad))
+    nodes = 0.5 * (nodes + 1.0)
+    weights = 0.5 * weights
+    log_M = pt.log(pt.sum(pt.as_tensor_variable(weights)[None, :]
+                          * pt.exp(kappa[:, None] * pt.as_tensor_variable(nodes ** 2)[None, :]),
+                          axis=1))
+    cos2 = pt.dot(n, axes.T) ** 2
+    return kappa[None, :] * cos2 - log_M[None, :]
+
+
+def component_overlap_pt(log_components, n_points: int):
+    """Bhattacharyya overlap ``(K, K)`` of components from their ``(M, K)`` log densities on uniform normals."""
+    half = 0.5 * log_components
+    m = pt.max(half, axis=0, keepdims=True)
+    e = pt.exp(half - m)
+    return pt.dot(e.T, e) / float(n_points) * pt.exp(m.T + m)
+
+
+def overlap_penalty_pt(overlap, pi, min_overlap: float, strength: float):
+    """Soft penalty keeping every component within ``min_overlap`` of the dominant one.
+
+    The dominant component is the one with the largest weight, so the term is
+    symmetric under relabelling.  Returns ``(penalty, overlap_with_main)``.
+    """
+    main = pt.argmax(pi)
+    o_main = overlap[:, main]
+    shortfall = pt.maximum(0.0, float(min_overlap) - o_main)
+    return -float(strength) * pt.sum(shortfall ** 2), o_main
+
+
+def _bingham_components_numpy(n, axes, kappas):
+    from scipy.special import ive
+    nodes, w = np.polynomial.legendre.leggauss(64)
+    om = 1.0 - nodes ** 2
+    out = np.empty((n.shape[0], axes.shape[0]))
+    for k in range(axes.shape[0]):
+        k1, k2 = kappas[k]
+        hd = abs(0.5 * (k1 - k2)) * om
+        log_c = np.log(np.sum(w / 2.0 * np.exp(-om * 0.5 * (k1 + k2) + hd) * ive(0, hd)))
+        c = (n @ axes[k]) ** 2
+        out[:, k] = -(k1 * c[:, 0] + k2 * c[:, 1]) - log_c
+    return out
+
+
+def _watson_components_numpy(n, axes, kappa):
+    nodes, w = np.polynomial.legendre.leggauss(48)
+    nodes = 0.5 * (nodes + 1.0)
+    w = 0.5 * w
+    log_M = np.log(np.sum(w[None, :] * np.exp(kappa[:, None] * nodes[None, :] ** 2), axis=1))
+    return kappa[None, :] * (n @ axes.T) ** 2 - log_M[None, :]
+
+
+def overlap_prior_log_norm(spec: Dict[str, Any], n_samples: int = 4000, seed: int = 0) -> float:
+    """``log E_prior[exp(penalty)]``: the log prior mass of the admissible fabric region.
+
+    The overlap penalty is applied as a potential, so the evidence a sampler
+    reports is that of the unnormalized penalized prior; subtracting this
+    value gives the evidence under the properly normalized prior, which is
+    what a comparison with an unconstrained model needs.  Zero when the
+    constraint is off or ``K == 1``.
+    """
+    K = int(spec["fabric_K"])
+    o_min, gamma = float(spec["fabric_min_overlap"]), float(spec["fabric_overlap_strength"])
+    if K < 2 or o_min <= 0.0 or gamma <= 0.0:
+        return 0.0
+    rng = np.random.default_rng(seed)
+    n = sobol_unit_normals(spec["product_qmc_power"], spec["table"]["seed"])
+    sigma = float(spec["fabric_kappa_sigma"])
+    log_terms = np.empty(n_samples)
+    for i in range(n_samples):
+        q = rng.normal(size=(K, 4))
+        q /= np.linalg.norm(q, axis=1, keepdims=True)
+        rots = np.stack([_quat_to_rotation_numpy(qk) for qk in q])
+        pi = rng.dirichlet(float(spec["fabric_pi_alpha"]) * np.ones(K))
+        if spec["fabric_family"] == "bingham":
+            kap = np.abs(rng.normal(scale=sigma, size=(K, 2)))
+            lc = _bingham_components_numpy(n, rots, kap)
+        else:
+            kap = np.abs(rng.normal(scale=sigma, size=K))
+            lc = _watson_components_numpy(n, rots[:, :, 2], kap)
+        e = np.exp(0.5 * (lc - lc.max(axis=0, keepdims=True)))
+        overlap = (e.T @ e) / n.shape[0] * np.exp(0.5 * (lc.max(axis=0)[:, None] + lc.max(axis=0)[None, :]))
+        o_main = overlap[:, int(np.argmax(pi))]
+        log_terms[i] = -gamma * np.sum(np.maximum(0.0, o_min - o_main) ** 2)
+    m = log_terms.max()
+    return float(m + np.log(np.mean(np.exp(log_terms - m))))
+
+
+def _quat_to_rotation_numpy(q):
+    w, x, y, z = q
+    return np.array([
+        [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+        [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+        [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+    ])
 
 
 def _axis_index(grid: np.ndarray, value):

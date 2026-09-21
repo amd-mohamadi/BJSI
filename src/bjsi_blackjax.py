@@ -1171,7 +1171,9 @@ def Bayesian_joint_plane_selection_SMC(
     shear_weight: float = 0.1,
     weighted_likelihood: bool = False,
     likelihood_weight_mode: str = "plane",
-    tau_weight_exponent: float = 2.0,
+    # Exponent p of the per-event shear weights tau**p. p = 0 gives unit weights,
+    # which the fault-population normalizer assumes.
+    tau_weight_exponent: float = 0.0,
     normalize_tau_weights: bool = False,
     tau_weight_clip: Optional[Tuple[float, float]] = None,
     event_weights: Optional[np.ndarray] = None,

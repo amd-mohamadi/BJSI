@@ -626,6 +626,24 @@ def _build_joint_model(
                         log_g1 = pt.logaddexp(log_w + log_g1, log_1mw + log_h1)
                         log_g2 = pt.logaddexp(log_w + log_g2, log_1mw + log_h2)
 
+                if pop_spec["fabric_K"] > 1 and pop_spec["fabric_min_overlap"] > 0.0:
+                    # Every component must overlap the dominant one: secondary
+                    # families are rotations or splays of the main set, not
+                    # unrelated sets.  See fault_population.py.
+                    n_ov = _fp.sobol_unit_normals(pop_spec["product_qmc_power"], pop_spec["table"]["seed"])
+                    n_ov_t = pt.as_tensor_variable(n_ov)
+                    if pop_spec["fabric_family"] == "bingham":
+                        log_comp = _fp.log_bingham_components_pt(n_ov_t, axes, fabric_kappa)
+                    else:
+                        log_comp = _fp.log_watson_components_pt(n_ov_t, axes, fabric_kappa)
+                    overlap = _fp.component_overlap_pt(log_comp, n_ov.shape[0])
+                    penalty, o_main = _fp.overlap_penalty_pt(
+                        overlap, fabric_pi, pop_spec["fabric_min_overlap"],
+                        pop_spec["fabric_overlap_strength"],
+                    )
+                    pm.Deterministic("fabric_overlap", o_main)
+                    pm.Potential("fabric_overlap_penalty", penalty)
+
                 # Prior plane probability implied by the population.
                 log_gsum = pt.logaddexp(log_g1, log_g2)
                 p2 = pm.Deterministic("p_plane2", pt.clip(pt.exp(log_g2 - log_gsum), eps, 1.0 - eps))
@@ -881,7 +899,9 @@ def _population_results(idata, fault_population) -> Optional[Dict[str, Any]]:
     """
     if fault_population is None or str(fault_population).strip().lower() in {"legacy", "none", "off"}:
         return None
-    out: Dict[str, Any] = {"spec": fault_population}
+    # The resolved specification records every default that applied.
+    spec = _fp.resolve_population_spec(fault_population, selection_beta=1.0, friction_range=(0.2, 1.0))
+    out: Dict[str, Any] = {"spec": {k: v for k, v in spec.items() if not k.startswith("_")}}
     post = getattr(idata, "posterior", None)
     if post is None:
         return out
@@ -893,6 +913,15 @@ def _population_results(idata, fault_population) -> Optional[Dict[str, Any]]:
                 "equal_tail_90": [float(np.quantile(values, 0.05)),
                                   float(np.quantile(values, 0.95))],
             }
+    if "fabric_overlap" in post:
+        o = post["fabric_overlap"].values
+        out["fabric_overlap"] = {
+            "min_overlap": spec["fabric_min_overlap"],
+            "strength": spec["fabric_overlap_strength"],
+            "median": np.median(o, axis=(0, 1)).tolist(),
+            "fraction_below": float(np.mean(np.any(o < spec["fabric_min_overlap"], axis=-1))),
+            "prior_log_norm": _fp.overlap_prior_log_norm(spec),
+        }
     if "fabric_kappa" in post:
         out["fabric_kappa_median"] = np.median(post["fabric_kappa"].values, axis=(0, 1)).tolist()
         if "fabric_pi" in post:
@@ -923,9 +952,9 @@ def Bayesian_joint_plane_selection_SMC(
     infer_friction_method: str = "posthoc",
     friction_prior_params: Tuple[float, float] = (2.0, 2.0),
     friction_range: Tuple[float, float] = (0.2, 0.9),
-    draws: int = 1000,
-    chains: int = 1,
-    cores: int = 4,
+    draws: int = 2500,
+    chains: int = 2,
+    cores: int = 2,
     threshold: float = 0.25,
     correlation_threshold: float = 0.01,
     kernel: str = "IMH",
@@ -938,9 +967,10 @@ def Bayesian_joint_plane_selection_SMC(
     # False -> Bayesian joint selection (soft plane prior + slip likelihood)
     iterative_plane_selection: bool = False,
     iterative_kwargs: Optional[Dict[str, Any]] = None,
-    # Plane-selection prior sharpness (sigmoid beta). If None, falls back to instability_beta
-    # for backward compatibility.
-    selection_beta: Optional[float] = None,
+    # Plane-selection prior sharpness (sigmoid beta) of the legacy mixture and the
+    # 'exp' population family; the ramp family does not use it. If None, falls
+    # back to instability_beta for backward compatibility.
+    selection_beta: Optional[float] = 10.0,
     # Scale for the Gaussian slip likelihood (small-angle approximation).
     slip_misfit_sigma: float = 0.35,
     # Slip-direction likelihood family.
@@ -969,7 +999,9 @@ def Bayesian_joint_plane_selection_SMC(
     # shear traction (recommended). "plane": per-plane weights (EXPERIMENTAL,
     # couples the weight to nodal-plane selection; see _tau_weights).
     likelihood_weight_mode: str = "event",
-    tau_weight_exponent: float = 2.0,
+    # Exponent p of the per-event shear weights tau**p. p = 0 gives unit weights,
+    # which the fault-population normalizer assumes.
+    tau_weight_exponent: float = 0.0,
     normalize_tau_weights: bool = False,
     tau_weight_clip: Optional[Tuple[float, float]] = None,
     event_weights: Optional[np.ndarray] = None,
@@ -981,22 +1013,26 @@ def Bayesian_joint_plane_selection_SMC(
     plane2_prior_probs: Optional[np.ndarray] = None,
     plane_prior_strength: float = 0.0,
     clustering_prior_strength: float = 0.0,
-    strike_sigma_deg=5.0,
-    dip_sigma_deg=5.0,
-    rake_sigma_deg=5.0,
+    strike_sigma_deg=0.0,
+    dip_sigma_deg=0.0,
+    rake_sigma_deg=0.0,
     fixed_plane_indices: Optional[np.ndarray] = None,
-    fault_population=None,
+    # "default" is fault_population.DEFAULT_FAULT_POPULATION (ramp, inferred
+    # I_min, one Bingham fabric component, overlap >= 0.2); None is the
+    # historical unnormalized mixture.
+    fault_population="default",
 ) -> Dict[str, Any]:
     """
     Joint Bayesian inference of stress orientation, shape ratio, and nodal plane selection using SMC.
 
     Measurement uncertainty: strike_sigma_deg, dip_sigma_deg, rake_sigma_deg
     are independent one-sigma local errors in degrees for the FIRST supplied
-    nodal plane. Each accepts a scalar (default 5 degrees) or an (N,) array.
-    Both nodal planes share one latent mechanism. Set all three to zero to
-    reproduce the exact-angle legacy model. The directional likelihood still
-    describes residual model scatter; these errors additionally describe SDR
-    measurement uncertainty. Posterior canonical plane-1 angles are stored in
+    nodal plane. Each accepts a scalar or an (N,) array. All three default to
+    zero (exact-angle model: the mechanisms enter as fixed data). Nonzero
+    values add three latent mechanism parameters per event, sharing one
+    latent mechanism between both nodal planes. The directional likelihood
+    still describes residual model scatter; these errors additionally
+    describe SDR measurement uncertainty. Posterior canonical plane-1 angles are stored in
     idata.posterior["mechanism_angles_deg"] when any error is nonzero.
 
     fixed_plane_indices optionally fixes all fault labels externally (0/1 for
@@ -1006,11 +1042,14 @@ def Bayesian_joint_plane_selection_SMC(
 
     fault_population selects the model used for nodal-plane selection.
 
-    ``None`` (default) keeps the historical behaviour: the mixture weights are
-    ``sigmoid(beta * (I2 - I1))`` and the mixture is used without a normalizer.
-    That term is not a probability density in the observed mechanism, and its
-    total mass grows with mu, which biases the inferred friction upward. Results
-    obtained with it are reproduced exactly by this default.
+    ``"default"`` selects ``fault_population.DEFAULT_FAULT_POPULATION``: the
+    ramp density with inferred ``I_min`` and one Bingham fabric component
+    (``fabric_K=1``), whose extra components (``fabric_K > 1``) must overlap
+    the dominant one by at least 0.2. ``None`` keeps the historical behaviour:
+    the mixture weights are ``sigmoid(beta * (I2 - I1))`` and the mixture is
+    used without a normalizer. That term is not a probability density in the
+    observed mechanism, and its total mass grows with mu, which biases the
+    inferred friction upward.
 
     Any other value replaces the logistic weight by an explicit fault-population
     density g(I) on the sphere of fault normals and adds the matching normalizer
@@ -1020,12 +1059,13 @@ def Bayesian_joint_plane_selection_SMC(
         fault_population="exp"
             g = exp(beta I), the generative model whose plane probabilities are
             identical to the historical weights, now normalized.
-        fault_population={"family": "ramp", "imin": "infer"}
+        fault_population={"family": "ramp", "imin": "infer", "fabric_K": 0}
             g = softplus(k (I - I_min)) / (k (1 - I_min)) with I_min inferred,
-            the recommended stress-controlled model.
+            the purely stress-controlled model.
         fault_population={"family": "ramp", "imin": "infer", "fabric_K": 2}
-            adds K axial Watson clusters for an inherited fabric, with the
-            stress-selected fraction w inferred and reported as ``w_population``.
+            K Bingham clusters for an inherited fabric, with the stress-selected
+            fraction w inferred and reported as ``w_population``; components
+            beyond the dominant one are perturbations of it (``fabric_min_overlap``).
 
     The normalizer is tabulated once per configuration and cached on disk; the
     first call with a new configuration spends a few minutes building it. See
@@ -1087,11 +1127,11 @@ def Bayesian_joint_plane_selection_SMC(
         Beta(3,3) is fairly neutral, centered around 0.5 → μ ≈ 0.6 with friction_range=(0.2,1.0).
     friction_range : tuple of float, default (0.2, 1.0)
         (min, max) range for friction coefficient μ. Beta prior is scaled to this range.
-    draws : int, default 1000
+    draws : int, default 2500
         Number of SMC particles (samples) per chain. More draws = better posterior approximation.
-    chains : int, default 1
+    chains : int, default 2
         Number of independent SMC chains. Usually chains=1 with many draws for SMC.
-    cores : int, default 4
+    cores : int, default 2
         Number of CPU cores for parallel tempering stages within SMC.
     threshold : float, default 0.25
         ESS (Effective Sample Size) threshold for resampling. Lower = fewer tempering stages.
@@ -1701,12 +1741,15 @@ def Bayesian_joint_plane_selection_NUTS(
     infer_friction_method: str = "sample",
     friction_prior_params: Tuple[float, float] = (3.0, 3.0),
     friction_range: Tuple[float, float] = (0.2, 1.0),
-    draws: int = 1000,
+    draws: int = 2500,
     tune: int = 1000,
     chains: int = 2,
-    cores: int = 4,
-    target_accept: float = 0.9,
-    nuts_sampler: Optional[str] = None,
+    cores: int = 2,
+    target_accept: float = 0.6,
+    # "smc": BlackJAX adaptive tempered SMC (bjsi_smc.sample_smc); draws are
+    # then particles and chains independent runs, with cores of them
+    # concurrent.  "nutpie", "numpyro" or "pymc" select a NUTS backend.
+    nuts_sampler: Optional[str] = "smc",
     nuts_sampler_kwargs: Optional[Dict[str, Any]] = None,
     random_seed: Optional[int] = None,
     progressbar: bool = True,
@@ -1717,9 +1760,10 @@ def Bayesian_joint_plane_selection_NUTS(
     # False -> Bayesian joint selection (soft plane prior + slip likelihood)
     iterative_plane_selection: bool = False,
     iterative_kwargs: Optional[Dict[str, Any]] = None,
-    # Plane-selection prior sharpness (sigmoid beta). If None, falls back to instability_beta
-    # for backward compatibility.
-    selection_beta: Optional[float] = None,
+    # Plane-selection prior sharpness (sigmoid beta) of the legacy mixture and the
+    # 'exp' population family; the ramp family does not use it. If None, falls
+    # back to instability_beta for backward compatibility.
+    selection_beta: Optional[float] = 10.0,
     # Scale for the Gaussian slip likelihood (small-angle approximation).
     slip_misfit_sigma: float = 0.35,
     # Slip-direction likelihood family.
@@ -1744,7 +1788,9 @@ def Bayesian_joint_plane_selection_NUTS(
     # shear traction (recommended). "plane": per-plane weights (EXPERIMENTAL,
     # couples the weight to nodal-plane selection; see _tau_weights).
     likelihood_weight_mode: str = "event",
-    tau_weight_exponent: float = 2.0,
+    # Exponent p of the per-event shear weights tau**p. p = 0 gives unit weights,
+    # which the fault-population normalizer assumes.
+    tau_weight_exponent: float = 0.0,
     normalize_tau_weights: bool = False,
     tau_weight_clip: Optional[Tuple[float, float]] = None,
     event_weights: Optional[np.ndarray] = None,
@@ -1756,11 +1802,14 @@ def Bayesian_joint_plane_selection_NUTS(
     plane2_prior_probs: Optional[np.ndarray] = None,
     plane_prior_strength: float = 0.0,
     clustering_prior_strength: float = 0.0,
-    strike_sigma_deg=5.0,
-    dip_sigma_deg=5.0,
-    rake_sigma_deg=5.0,
+    strike_sigma_deg=0.0,
+    dip_sigma_deg=0.0,
+    rake_sigma_deg=0.0,
     fixed_plane_indices: Optional[np.ndarray] = None,
-    fault_population=None,
+    # "default" is fault_population.DEFAULT_FAULT_POPULATION (ramp, inferred
+    # I_min, one Bingham fabric component, overlap >= 0.2); None is the
+    # historical unnormalized mixture.
+    fault_population="default",
     initvals=None,
 ) -> Dict[str, Any]:
     """
@@ -1768,11 +1817,12 @@ def Bayesian_joint_plane_selection_NUTS(
 
     Measurement uncertainty: strike_sigma_deg, dip_sigma_deg, rake_sigma_deg
     are independent one-sigma local errors in degrees for the FIRST supplied
-    nodal plane. Each accepts a scalar (default 5 degrees) or an (N,) array.
-    Both nodal planes share one latent mechanism. Set all three to zero to
-    reproduce the exact-angle legacy model. The directional likelihood still
-    describes residual model scatter; these errors additionally describe SDR
-    measurement uncertainty. Posterior canonical plane-1 angles are stored in
+    nodal plane. Each accepts a scalar or an (N,) array. All three default to
+    zero (exact-angle model: the mechanisms enter as fixed data). Nonzero
+    values add three latent mechanism parameters per event, sharing one
+    latent mechanism between both nodal planes. The directional likelihood
+    still describes residual model scatter; these errors additionally
+    describe SDR measurement uncertainty. Posterior canonical plane-1 angles are stored in
     idata.posterior["mechanism_angles_deg"] when any error is nonzero.
 
     fixed_plane_indices optionally fixes all fault labels externally (0/1 for
@@ -1782,11 +1832,14 @@ def Bayesian_joint_plane_selection_NUTS(
 
     fault_population selects the model used for nodal-plane selection.
 
-    ``None`` (default) keeps the historical behaviour: the mixture weights are
-    ``sigmoid(beta * (I2 - I1))`` and the mixture is used without a normalizer.
-    That term is not a probability density in the observed mechanism, and its
-    total mass grows with mu, which biases the inferred friction upward. Results
-    obtained with it are reproduced exactly by this default.
+    ``"default"`` selects ``fault_population.DEFAULT_FAULT_POPULATION``: the
+    ramp density with inferred ``I_min`` and one Bingham fabric component
+    (``fabric_K=1``), whose extra components (``fabric_K > 1``) must overlap
+    the dominant one by at least 0.2. ``None`` keeps the historical behaviour:
+    the mixture weights are ``sigmoid(beta * (I2 - I1))`` and the mixture is
+    used without a normalizer. That term is not a probability density in the
+    observed mechanism, and its total mass grows with mu, which biases the
+    inferred friction upward.
 
     Any other value replaces the logistic weight by an explicit fault-population
     density g(I) on the sphere of fault normals and adds the matching normalizer
@@ -1796,12 +1849,13 @@ def Bayesian_joint_plane_selection_NUTS(
         fault_population="exp"
             g = exp(beta I), the generative model whose plane probabilities are
             identical to the historical weights, now normalized.
-        fault_population={"family": "ramp", "imin": "infer"}
+        fault_population={"family": "ramp", "imin": "infer", "fabric_K": 0}
             g = softplus(k (I - I_min)) / (k (1 - I_min)) with I_min inferred,
-            the recommended stress-controlled model.
+            the purely stress-controlled model.
         fault_population={"family": "ramp", "imin": "infer", "fabric_K": 2}
-            adds K axial Watson clusters for an inherited fabric, with the
-            stress-selected fraction w inferred and reported as ``w_population``.
+            K Bingham clusters for an inherited fabric, with the stress-selected
+            fraction w inferred and reported as ``w_population``; components
+            beyond the dominant one are perturbations of it (``fabric_min_overlap``).
 
     The normalizer is tabulated once per configuration and cached on disk; the
     first call with a new configuration spends a few minutes building it. See

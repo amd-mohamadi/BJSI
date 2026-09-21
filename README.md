@@ -9,7 +9,9 @@ BJSI jointly estimates stress orientation, stress shape ratio `R`, friction `mu`
 
 ## Core code (`src/`)
 
-- `src/bjsi.py`: Bayesian inversion engine (NUTS-based joint plane selection).
+- `src/bjsi.py`: Bayesian inversion engine (joint plane selection; SMC by default, NUTS optional).
+- `src/fault_population.py`: fault-population densities (stress-selected ramp, Bingham/Watson fabric components, overlap prior).
+- `src/bjsi_smc.py`: BlackJAX adaptive tempered SMC sampler with log-evidence output.
 - `src/ilsi.py`: deterministic stress-inversion and instability utilities (ILSI).
 - `src/utils_stress.py`: focal geometry, traction, and residual helper functions (ILSI).
 - `src/plot_stress_output.py`: plotting and posterior diagnostic helpers used by the example script.
@@ -19,6 +21,25 @@ BJSI jointly estimates stress orientation, stress shape ratio `R`, friction `mu`
 - **Joint Inversion**: Simultaneously solves for stress state ($R$, principal directions) and the true fault plane from ambiguous focal mechanisms.
 - **Clustering Prior**: Incorporates a `clustering_prior_strength` parameter to resolve ambiguous plane selections by learning from unambiguous events in the same dataset. This probabilistic weighting mechanism calculates a certainty-weighted confident orientation tensor ($T_{conf}$) to guide the selection for ambiguous events based on the prevailing geometric trend of high-confidence selections.
 - **Friction Estimation**: Optionally infers the macroscopic friction coefficient (`mu`) simultaneously with the stress state.
+
+## Default model and sampler
+
+`Bayesian_joint_plane_selection_NUTS` defaults to the reference configuration:
+
+- `nuts_sampler="smc"`: BlackJAX adaptive tempered SMC (`draws=2500` particles,
+  `chains=2` independent runs whose log evidences must agree, `cores=2`,
+  `target_accept=0.6`); pass `"nutpie"`, `"numpyro"` or `"pymc"` for NUTS.
+- `fault_population="default"`, i.e. `fault_population.DEFAULT_FAULT_POPULATION`:
+  the stress-selected ramp density with inferred `I_min` and one Bingham
+  fabric component (`fabric_K=1`). Extra components (`fabric_K > 1`, a
+  diagnostic for orientation complexity) must overlap the dominant one by a
+  Bhattacharyya coefficient of at least `fabric_min_overlap=0.2`
+  (`fabric_overlap_strength=2000`), so that they are perturbations of one
+  fault family rather than an unrelated set. A dictionary replaces only the
+  keys it contains; `None` gives the historical unnormalized mixture.
+- `selection_beta=10`, `clustering_prior_strength=0`, `tau_weight_exponent=0`
+  (unit event weights, which the population normalizer assumes) and zero
+  mechanism-angle errors.
 
 ## Example workflow (`Geysers_inversion.py`)
 
@@ -75,15 +96,16 @@ The script writes results under `Geysers_output/`:
 The PyMC NUTS and SMC entry points accept `strike_sigma_deg`, `dip_sigma_deg`,
 and `rake_sigma_deg`. Each is a one-standard-deviation measurement error in
 degrees, supplied either globally as a scalar or separately for each event as
-an array of length N. **All three now default to 5 degrees.** Explicitly set all
-three to zero to reproduce the previous exact-angle model.
+an array of length N. **All three default to zero** (exact-angle model, the
+mechanisms enter as fixed data). Set them to nonzero values to sample one
+latent mechanism per event.
 
 The model draws one latent mechanism per event using independent local Gaussian
 offsets from the first supplied nodal plane's strike, dip, and rake. It derives
 the auxiliary plane from that same mechanism, preserving the double couple.
 Angle wrapping and dip-boundary crossings are handled through the normal/slip
 vectors. This is a local SDR error model, not a rotation-invariant distribution;
-the 5-degree default is an assumption to test against actual catalog errors.
+a value such as 5 degrees is an assumption to test against actual catalog errors.
 The directional likelihood retains its existing residual-scatter parameter.
 
 To condition stress inference on externally supplied fault labels:
