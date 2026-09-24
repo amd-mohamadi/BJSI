@@ -16,10 +16,11 @@ the sphere with density proportional to a population weight ``g(I(n))`` and the
 slip is drawn from the directional likelihood about the resolved shear traction.
 Marginalizing the unknown plane label gives, for one event,
 
-    p(x | theta) = [g(I_1) L_1 + g(I_2) L_2] / Z(theta),
+    p(x | theta) = [g(I_1) L_1 + g(I_2) L_2] / (2 Z(theta)),
     Z(theta)     = E_n[ g(I(n)) ],
 
-where the expectation is over normals uniform on the sphere.  The conditional
+where the expectation is over normals uniform on the sphere and the factor
+1/2 averages the two equivalent plane labelings.  The conditional
 plane probability is ``g(I_2) / (g(I_1) + g(I_2))``, so ``g = exp(beta I)``
 reproduces the historical weights exactly while supplying the missing ``Z``.
 
@@ -62,6 +63,15 @@ stress,
 so both terms act on every fault.  ``Z`` then depends on the fabric axes
 relative to the stress frame and is not tabulated; it is a quasi-Monte Carlo
 average over ``2**product_qmc_power`` fixed Sobol normals inside the graph.
+
+``fabric_on='slip'`` places the additive fabric on the slip directions instead
+of the fault normals, ``g_mix = w g(I(n)) + (1 - w) h(s)``.  Faults of varied
+dip reactivated by one stress, or by pore-pressure diffusion, can share a slip
+direction while their normals spread; a fabric on normals then prefers the
+auxiliary planes, whose normals are those shared slip vectors. The historical
+slip mode retains the normal-fabric normalizer for compatibility;
+it does not normalize the joint mechanism density after multiplication by the
+stress-dependent slip likelihood. The product form is only defined on normals.
 
 Related families
 ----------------
@@ -127,17 +137,23 @@ _DEFAULT_PRODUCT_POWER = 10   # Sobol normals for the in-graph product normalize
 _DEFAULT_SEED = 20260916
 _DEFAULT_RAMP_K = 100.0
 
-# Default population: the stress-selected ramp with inferred I_min and one
-# Bingham fabric component (K = 1).  Extra components must overlap the main
-# one by at least 0.2 (Bhattacharyya) so that K > 1 stays a perturbation of
-# one fault family.  ``fault_population=None`` still selects the legacy model.
+# Default population: the stress-selected ramp with I_min = 0.7 and one
+# Bingham fabric component (K = 1).  I_min = 0.7 encodes the Mohr-Coulomb
+# expectation that faults which slip are close to optimally oriented; the
+# softplus ramp keeps it soft, so less unstable planes (elevated pore pressure,
+# low friction, mechanism errors) stay possible through the fabric term.  A
+# fixed threshold also keeps the instability contrast between the two nodal
+# planes strong, whereas an inferred I_min is weakly constrained and can drift
+# down to the auxiliary planes' instability.  Extra components must overlap the
+# main one by at least 0.3 (Bhattacharyya) so that K > 1 stays a perturbation
+# of one fault family.  ``fault_population=None`` still selects the legacy model.
 DEFAULT_FAULT_POPULATION: Dict[str, Any] = {
     "family": "ramp",
-    "imin": "infer",
+    "imin": 0.7,
     "fabric_K": 1,
     "fabric_family": "bingham",
     "fabric_pi_alpha": 1.0,
-    "fabric_min_overlap": 0.2,
+    "fabric_min_overlap": 0.3,
     "fabric_overlap_strength": 2000.0,
 }
 # Bump when the definition of any population weight changes, so that cached
@@ -161,12 +177,13 @@ def resolve_population_spec(
     unnormalized mixture, ``"default"`` for :data:`DEFAULT_FAULT_POPULATION`,
     a family name, or a dictionary with the keys below.
     Missing keys take the values of :data:`DEFAULT_FAULT_POPULATION`: a ramp
-    with inferred ``imin``, one Bingham fabric component, ``fabric_pi_alpha``
-    1 and a minimum overlap of 0.2 enforced with strength 2000.
+    with ``imin`` 0.7, one Bingham fabric component, ``fabric_pi_alpha``
+    1 and a minimum overlap of 0.3 enforced with strength 2000.
 
     family : {'legacy', 'exp', 'ramp'}
     beta : float, for the 'exp' family; defaults to the model's selection beta
-    imin : float or 'infer', for the 'ramp' family
+    imin : float or 'infer', for the 'ramp' family (default 0.7); 'infer'
+        samples it within ``imin_bounds``
     imin_bounds : (low, high) prior support when ``imin='infer'``
     k : float, sharpness of the ramp softplus
     normalize : bool, add the ``-N log Z`` potential
@@ -179,9 +196,17 @@ def resolve_population_spec(
     fabric_pi_alpha : float, Dirichlet concentration on the fabric proportions;
         values below one favour switching components off
     fabric_min_overlap : float in [0, 1), minimum Bhattacharyya overlap of
-        every extra component with the dominant one (default 0.2), 0 to disable
+        every extra component with the dominant one (default 0.3), 0 to disable
     fabric_overlap_strength : float, stiffness of the overlap penalty
         (default 2000)
+    fabric_on : {'normal', 'slip'}, vectors the fabric describes (default
+        'normal'); 'slip' requires the additive form
+    w_prior : [a, b] or None, Beta(a, b) prior on the stress-selected fraction
+        ``w`` (default None, uniform); e.g. [4, 2] keeps the stress term from
+        being absorbed by a concentrated fabric
+    w_fixed : float in (0, 1) or None, hold ``w`` at this value instead of
+        inferring it (default None); excludes ``w_prior``.  Use it to test how
+        much the stress term can steer plane selection against the fabric
     table : dict, overrides for the normalizer grid and sampling
     """
     if fault_population is None:
@@ -218,13 +243,36 @@ def resolve_population_spec(
         "fabric_kappa_sigma": float(spec.get("fabric_kappa_sigma", 40.0)),
         "fabric_pi_alpha": float(spec.get("fabric_pi_alpha", _D["fabric_pi_alpha"])),
         "fabric_mode": str(spec.get("fabric_mode", "additive")).strip().lower(),
+        "fabric_on": str(spec.get("fabric_on", "normal")).strip().lower(),
         "product_qmc_power": int(spec.get("product_qmc_power", _DEFAULT_PRODUCT_POWER)),
         "fabric_min_overlap": float(spec.get("fabric_min_overlap", _D["fabric_min_overlap"])),
         "fabric_overlap_strength": float(spec.get("fabric_overlap_strength", _D["fabric_overlap_strength"])),
         "table": dict(spec.get("table", {})),
     }
+    w_prior = spec.get("w_prior")
+    if w_prior is not None:
+        w_prior = [float(v) for v in w_prior]
+        if len(w_prior) != 2 or not all(np.isfinite(v) and v > 0.0 for v in w_prior):
+            raise ValueError("w_prior must be [a, b] with a, b > 0 (a Beta prior on w_population)")
+        if not (out["mix_uniform"] or (out["fabric_K"] > 0 and out["fabric_mode"] == "additive")):
+            raise ValueError("w_prior needs the weight w: an additive fabric or mix_uniform")
+    out["w_prior"] = w_prior
+    w_fixed = spec.get("w_fixed")
+    if w_fixed is not None:
+        w_fixed = float(w_fixed)
+        if not (0.0 < w_fixed < 1.0):
+            raise ValueError("w_fixed must lie in (0, 1)")
+        if w_prior is not None:
+            raise ValueError("w_fixed and w_prior are mutually exclusive")
+        if not (out["mix_uniform"] or (out["fabric_K"] > 0 and out["fabric_mode"] == "additive")):
+            raise ValueError("w_fixed needs the weight w: an additive fabric or mix_uniform")
+    out["w_fixed"] = w_fixed
     if out["fabric_mode"] not in {"additive", "product"}:
         raise ValueError("fabric_mode must be 'additive' or 'product'")
+    if out["fabric_on"] not in {"normal", "slip"}:
+        raise ValueError("fabric_on must be 'normal' or 'slip'")
+    if out["fabric_on"] == "slip" and out["fabric_mode"] == "product":
+        raise ValueError("fabric_on='slip' is only defined for fabric_mode='additive'")
     if out["fabric_mode"] == "product" and out["fabric_K"] < 1:
         raise ValueError("fabric_mode='product' requires fabric_K >= 1")
     if not 0.0 <= out["fabric_min_overlap"] < 1.0:
@@ -247,7 +295,7 @@ def resolve_population_spec(
         if not np.isfinite(out["beta"]) or out["beta"] < 0.0:
             raise ValueError("beta must be finite and >= 0")
     else:
-        imin = spec.get("imin", "infer")
+        imin = spec.get("imin", _D["imin"])
         out["k"] = float(spec.get("k", _DEFAULT_RAMP_K))
         if out["k"] <= 0.0:
             raise ValueError("k must be > 0")

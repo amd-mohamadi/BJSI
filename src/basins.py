@@ -11,6 +11,13 @@ population models need after sampling.
     parameters of each group, so that a large ``r_hat`` can be read as "three
     basins" instead of "not converged".
 
+``pool_runs`` / ``pooled_results``
+    Combine independent SMC runs by their evidence.  Each run targets the
+    whole posterior, so runs that disagree have each missed part of it; the
+    mixture of runs weighted by their evidence estimates is the pooled
+    posterior, and an equal-weight pool would give a run stuck in a mode of
+    negligible mass the same say as the dominant one.
+
 ``bridge_evidence``
     Estimates the log evidence of one chain by bridge sampling.  A chain
     confined to one basin, together with a proposal fitted to that chain, gives
@@ -32,7 +39,8 @@ from typing import Any, Dict, List, Optional, Sequence
 import numpy as np
 import pytensor
 
-__all__ = ["basin_report", "bridge_evidence", "chain_summary", "subset_results"]
+__all__ = ["basin_report", "bridge_evidence", "chain_summary", "pool_runs", "pooled_results",
+           "subset_results"]
 
 
 def _stress_directions(tensors: np.ndarray) -> tuple:
@@ -123,28 +131,107 @@ def subset_results(results: Dict[str, Any], chains: Sequence[int],
     depend on the posterior draws, such as the population spec and the basin
     report, are kept.
     """
+    chains = [int(c) for c in chains]
+    # Chains index the sampler's runs, which an evidence-pooled result keeps apart.
+    idata = results["idata_runs"] if results.get("idata_runs") is not None else results["idata"]
+    n_chains = idata.posterior.sizes["chain"]
+    if not chains or any(c < 0 or c >= n_chains for c in chains):
+        raise ValueError(f"chains must be a non-empty subset of range({n_chains}), got {chains}")
+    out = _resummarize(results, idata.sel(chain=chains), hdi_prob)
+    out["convergence"] = dict(results.get("convergence") or {},
+                              n_chains=len(chains), chains=chains,
+                              n_samples=len(chains) * idata.posterior.sizes["draw"])
+    return out
+
+
+def _resummarize(results: Dict[str, Any], idata, hdi_prob: Optional[float]) -> Dict[str, Any]:
+    """Copy of ``results`` with every posterior-derived entry taken from ``idata``."""
     try:
         from .bjsi import summarize_posterior
     except ImportError:
         from bjsi import summarize_posterior
-    chains = [int(c) for c in chains]
-    idata = results["idata"]
-    n_chains = idata.posterior.sizes["chain"]
-    if not chains or any(c < 0 or c >= n_chains for c in chains):
-        raise ValueError(f"chains must be a non-empty subset of range({n_chains}), got {chains}")
     if hdi_prob is None:
         hdi_prob = float((results.get("hdi") or {}).get("prob", 0.9))
     fixed_mu = results.get("mu") if results.get("mu_samples") is None else None
     out = dict(results)
-    out.update(summarize_posterior(idata.sel(chain=chains), hdi_prob=hdi_prob))
+    out.update(summarize_posterior(idata, hdi_prob=hdi_prob))
     if fixed_mu is not None:
         out["mu"] = fixed_mu
     if results.get("fixed_plane_indices") is not None:
         out["plane_selection_map"] = results["plane_selection_map"]
         out["plane_probabilities"] = results["plane_probabilities"]
-    out["convergence"] = dict(results.get("convergence") or {},
-                              n_chains=len(chains), chains=chains,
-                              n_samples=len(chains) * idata.posterior.sizes["draw"])
+    return out
+
+
+def pool_runs(idata, log_evidence: Optional[Sequence[float]] = None, *, seed: int = 0):
+    """Pool independent SMC runs, one per chain, weighted by their evidence.
+
+    Run ``c`` gets weight ``Z_c / sum(Z)``, the particles within a run being
+    equally weighted.  The pool is drawn by systematic resampling of
+    ``round(draws / sum(w**2))`` particles, so a dominant run is returned
+    whole, each particle once, and ``C`` runs of equal evidence are returned
+    whole as well.  The result has a single chain holding the pooled draws,
+    with ``sample_stats`` resampled alongside, and records the run weights in
+    ``attrs``.  ``log_evidence`` defaults to ``idata.attrs["log_evidence"]``.
+    """
+    import arviz as az
+    import xarray as xr
+
+    if log_evidence is None:
+        log_evidence = idata.attrs.get("log_evidence")
+    if log_evidence is None:
+        raise ValueError("pool_runs needs the log evidence of each run")
+    log_z = np.asarray(log_evidence, float)
+    n_chains, n_draws = idata.posterior.sizes["chain"], idata.posterior.sizes["draw"]
+    if log_z.shape != (n_chains,):
+        raise ValueError(f"log_evidence has {log_z.size} entries for {n_chains} runs")
+    weights = np.exp(log_z - log_z.max())
+    weights /= weights.sum()
+    n_out = max(1, int(round(n_draws / np.sum(weights ** 2))))
+    # Systematic resampling over (run, particle), each particle weighing w_run / draws.
+    cumulative = np.cumsum(np.repeat(weights / n_draws, n_draws))
+    cumulative[-1] = 1.0
+    u = (np.random.default_rng(seed).random() + np.arange(n_out)) / n_out
+    flat = np.searchsorted(cumulative, u, side="right")
+    chain_idx = xr.DataArray(flat // n_draws, dims="pooled")
+    draw_idx = xr.DataArray(flat % n_draws, dims="pooled")
+
+    def resample(ds):
+        out = ds.isel(chain=chain_idx, draw=draw_idx).drop_vars(["chain", "draw"], errors="ignore")
+        out = out.rename({"pooled": "draw"}).expand_dims(chain=[0])
+        return out.assign_coords(draw=np.arange(n_out)).transpose("chain", "draw", ...)
+
+    groups = {}
+    for group in idata.groups():
+        ds = getattr(idata, group)
+        groups[group] = resample(ds) if {"chain", "draw"} <= set(ds.dims) else ds
+    pooled = az.InferenceData(**groups)
+    pooled.attrs.update(idata.attrs)
+    pooled.attrs.update({"pooling": "evidence", "log_evidence": log_z.tolist(),
+                         "run_weights": weights.tolist(), "n_runs": int(n_chains)})
+    return pooled
+
+
+def pooled_results(results: Dict[str, Any], hdi_prob: Optional[float] = None,
+                   seed: int = 0) -> Dict[str, Any]:
+    """Re-summarize a multi-run SMC result from its evidence-weighted pool.
+
+    ``results["idata"]`` becomes the pool of :func:`pool_runs` and the runs are
+    kept as ``results["idata_runs"]`` for the basin tools.  A result that is
+    already pooled, has one run, or has no evidence is returned unchanged.
+    """
+    if results.get("idata_runs") is not None:
+        return results
+    idata = results["idata"]
+    log_z = (results.get("smc") or {}).get("log_evidence") or idata.attrs.get("log_evidence")
+    if log_z is None or idata.posterior.sizes["chain"] < 2:
+        return results
+    pooled = pool_runs(idata, log_z, seed=seed)
+    out = _resummarize(results, pooled, hdi_prob)
+    out["idata_runs"] = idata
+    out["convergence"] = dict(results.get("convergence") or {}, pooling="evidence",
+                              run_weights=pooled.attrs["run_weights"],
+                              n_samples=pooled.posterior.sizes["draw"])
     return out
 
 

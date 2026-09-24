@@ -23,14 +23,29 @@ final target after the last increment, and (iv) the increment of the log
 evidence is recorded.  Mutation is HMC with a diagonal mass matrix measured
 on the cloud (the default; it is what keeps the population at the posterior
 density on the fabric models), NUTS, or a random-walk Metropolis kernel with
-the particle covariance as proposal.  The waste-free
+the particle covariance as proposal.  The number of moves per tempering step
+is ``mcmc_steps``, or optionally adaptive (``move_tol``): the population is
+moved until a move no longer carries the particles appreciably further from
+their ancestors, with ``mcmc_steps`` as the cap.  The waste-free
 scheme of Dau and Chopin (2022) keeps every intermediate MCMC state so that
-``draws`` particles cost ``draws / mcmc_steps`` chains of ``mcmc_steps`` moves.
+``draws`` particles cost ``draws / mcmc_steps`` chains of ``mcmc_steps`` moves;
+it is used for the tempering increments only, and the rounds at the posterior
+move every particle.
+
+Speed.  The likelihood is a sum over events, so ``vmap`` over particles makes
+arrays of particles x events (tens of MB for thousands of events) that stream
+through memory at every operation.  The particles are instead split across
+host devices (one per CPU thread, set through ``XLA_FLAGS`` before JAX starts)
+and each device evaluates its particles one at a time with the per-event
+arrays in cache; on 1720 events this is 8x faster than ``vmap``.
 """
 from __future__ import annotations
 
 import math
+import os
+from functools import partial
 import time
+import warnings
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -51,7 +66,15 @@ KERNELS = ("rmh", "hmc", "nuts")
 
 # ---------------------------------------------------------------------------
 # JAX setup
+_DEVICE_FLAG = "xla_force_host_platform_device_count"
+
+
 def _import_jax():
+    # One host device per CPU thread; only effective if JAX has not yet
+    # started its CPU backend in this process (see _host_mesh).
+    flags = os.environ.get("XLA_FLAGS", "")
+    if _DEVICE_FLAG not in flags:
+        os.environ["XLA_FLAGS"] = f"{flags} --{_DEVICE_FLAG}={os.cpu_count() or 1}".strip()
     import jax
     import jax.numpy as jnp
     import blackjax
@@ -332,12 +355,52 @@ class _KernelTuning:
 
 
 # ---------------------------------------------------------------------------
+# Particle-parallel evaluation
+def _host_mesh(jax):
+    """A one-axis mesh over the host devices, or ``None`` when there is one device."""
+    devices = jax.devices()
+    if len(devices) < 2:
+        if devices[0].platform == "cpu" and (os.cpu_count() or 1) > 1:
+            warnings.warn(
+                "bjsi_smc runs on one CPU device: JAX started before bjsi_smc could set "
+                f"--{_DEVICE_FLAG}.  Set XLA_FLAGS=--{_DEVICE_FLAG}=<threads> before "
+                "importing JAX for the particle-parallel (several times faster) path.",
+                RuntimeWarning, stacklevel=3,
+            )
+        return None
+    from jax.sharding import Mesh
+    return Mesh(np.array(devices), ("p",))
+
+
+def _row_map(jax, mesh, fn, n_rows: int, n_shared: int):
+    """Map ``fn`` over the leading axis of its first ``n_rows`` arguments.
+
+    The remaining ``n_shared`` arguments are passed whole to every row.  With a
+    mesh the rows are split across the devices and each device evaluates its
+    rows one at a time, which keeps the per-event arrays of one particle in
+    cache; the row count must be a multiple of the device count (``_pad``).
+    Without a mesh this is ``vmap``.
+    """
+    if mesh is None:
+        return jax.vmap(fn, in_axes=(0,) * n_rows + (None,) * n_shared)
+    from jax.sharding import PartitionSpec as P
+
+    def local(*args):
+        rows, shared = args[:n_rows], args[n_rows:]
+        return jax.lax.map(lambda r: fn(*r, *shared), rows)
+
+    return jax.shard_map(local, mesh=mesh, in_specs=(P("p"),) * n_rows + (P(),) * n_shared,
+                         out_specs=P("p"))
+
+
+# ---------------------------------------------------------------------------
 # One SMC run
 def _run_one(jax, jnp, blackjax, compiled, *, particles0: np.ndarray, key, kernel: str,
-             mcmc_steps: int, waste_free: bool, target_ess: float, final_rounds: int,
-             max_iterations: int, tuning: _KernelTuning, hmc_integration_steps: int,
-             nuts_max_doublings: int, pilot_rounds: int, pilot_size: int, pilot_steps: int,
-             progressbar: bool, tag: str) -> Tuple[np.ndarray, Dict[str, Any]]:
+             mcmc_steps: int, waste_free: bool, move_tol: Optional[float], target_ess: float,
+             final_rounds: int, max_iterations: int, tuning: _KernelTuning,
+             hmc_integration_steps: int, nuts_max_doublings: int, pilot_rounds: int,
+             pilot_size: int, pilot_steps: int, mesh, progressbar: bool,
+             tag: str) -> Tuple[np.ndarray, Dict[str, Any]]:
     from blackjax.smc.resampling import systematic
 
     log_prior, log_lik = compiled["log_prior"], compiled["log_lik"]
@@ -349,54 +412,121 @@ def _run_one(jax, jnp, blackjax, compiled, *, particles0: np.ndarray, key, kerne
     if waste_free:
         if n % mcmc_steps != 0:
             raise ValueError(f"waste-free SMC needs draws ({n}) divisible by mcmc_steps ({mcmc_steps})")
-        n_ancestors, n_moves = n // mcmc_steps, mcmc_steps - 1
-    else:
-        n_ancestors, n_moves = n, mcmc_steps
+        if n // mcmc_steps < 1000:
+            warnings.warn(
+                f"waste-free SMC with {n // mcmc_steps} ancestors: the weights of posterior "
+                "basins that the kernel cannot cross rest on that many draws.  Use at least "
+                "1000 ancestors (draws >= 1000 * mcmc_steps).", RuntimeWarning, stacklevel=3,
+            )
+    n_devices = 1 if mesh is None else mesh.size
 
-    batched_lik = jax.jit(jax.vmap(log_lik))
-    tempered_grad = jax.jit(jax.vmap(jax.grad(lambda z, lam: log_prior(z) + lam * log_lik(z)),
-                                     in_axes=(0, None)))
+    def pad(tree):
+        """Repeat the first row until the row count is a multiple of the device count."""
+        def one(a):
+            extra = -a.shape[0] % n_devices
+            return a if extra == 0 else jnp.concatenate([a, jnp.repeat(a[:1], extra, axis=0)])
+        return jax.tree_util.tree_map(one, tree)
 
-    def run_chains(key, starts, lmbda, params, n_moves):
-        """``n_moves`` kernel moves from every row of ``starts`` under the tempered target."""
-        def logdensity(z):
-            return log_prior(z) + lmbda * log_lik(z)
+    def tempered(lmbda):
+        return lambda z: log_prior(z) + lmbda * log_lik(z)
 
-        def chain(key, z0):
-            state = init_fn(z0, logdensity)
+    def init_row(z, lmbda):
+        return init_fn(z, tempered(lmbda))
 
-            def body(state, k):
-                state, info = step_fn(k, state, logdensity, **params)
-                return state, (state.position, _acceptance(info))
+    def step_row(k, state, lmbda, params):
+        state, info = step_fn(k, state, tempered(lmbda), **params)
+        return state, _acceptance(info)
 
-            keys = jax.random.split(key, n_moves)
-            state, (positions, accept) = jax.lax.scan(body, state, keys)
-            return state.position, positions, accept
-
-        keys = jax.random.split(key, starts.shape[0])
-        return jax.vmap(chain)(keys, starts)
+    lik_rows = _row_map(jax, mesh, log_lik, 1, 0)
+    grad_rows = _row_map(jax, mesh, lambda z, lam: jax.grad(tempered(lam))(z), 1, 1)
+    init_rows = _row_map(jax, mesh, init_row, 1, 1)
+    step_rows = _row_map(jax, mesh, step_row, 2, 2)
 
     @jax.jit
-    def iteration(key, particles, loglik, lmbda_old, lmbda_new, params):
+    def batched_lik(z):
+        return lik_rows(pad(z))[: z.shape[0]]
+
+    @jax.jit
+    def tempered_grad(z, lmbda):
+        return grad_rows(pad(z), lmbda)[: z.shape[0]]
+
+    def move(key, states, lmbda, params):
+        """One kernel move of every particle (rows already padded)."""
+        keys = jax.random.split(key, jax.tree_util.tree_leaves(states)[0].shape[0])
+        return step_rows(keys, states, lmbda, params)
+
+    def mutate_fixed(key, starts, lmbda, params, n_moves: int):
+        """``n_moves`` moves from every row of ``starts``; returns the states after each move."""
+        m = starts.shape[0]
+        states = init_rows(pad(starts), lmbda)
+
+        def body(states, k):
+            states, accept = move(k, states, lmbda, params)
+            return states, (states.position[:m], accept[:m])
+
+        _, (history, accept) = jax.lax.scan(body, states, jax.random.split(key, n_moves))
+        return jnp.swapaxes(history, 0, 1), jnp.mean(accept)
+
+    def distance(a, b, scale_var):
+        """Mean distance between matched rows, in units of the proposal scale."""
+        return jnp.mean(jnp.sqrt(jnp.sum((a - b) ** 2 / scale_var, axis=1)))
+
+    def mutate_adaptive(key, starts, lmbda, params, scale_var):
+        """Move every row of ``starts`` while the moves still carry the particles away.
+
+        The chain length follows the adaptive rule of Chopin's ``particles``
+        package: after each move the mean distance of the particles from their
+        ancestors is measured, and the population stops once a move increases
+        it by less than ``move_tol`` of its previous value, or after
+        ``mcmc_steps`` moves.  The rule compares the distance with itself, so it
+        does not depend on how well ``scale_var`` matches the width of the
+        target, and particles held in separate copies of a mode (the symmetric
+        rotations) stop counting once they have explored their own copy.
+        """
+        m = starts.shape[0]
+
+        def cond(carry):
+            k, _, _, _, prev, dist = carry
+            if move_tol is None:
+                return k < mcmc_steps
+            growing = (k < 2) | (dist - prev >= move_tol * prev)
+            return (k < mcmc_steps) & growing
+
+        def body(carry):
+            k, states, key, accept_sum, _, dist = carry
+            key, sub = jax.random.split(key)
+            states, accept = move(sub, states, lmbda, params)
+            new_dist = distance(states.position[:m], starts, scale_var)
+            return k + 1, states, key, accept_sum + jnp.mean(accept[:m]), dist, new_dist
+
+        zero = jnp.float64(0.0)
+        carry = (jnp.int32(0), init_rows(pad(starts), lmbda), key, zero, zero, zero)
+        k, states, _, accept_sum, _, dist = jax.lax.while_loop(cond, body, carry)
+        return states.position[:m], accept_sum / k, k, dist
+
+    @partial(jax.jit, static_argnames=("wf",))
+    def iteration(key, particles, loglik, lmbda_old, lmbda_new, params, scale_var, wf):
         log_w = (lmbda_new - lmbda_old) * loglik
         log_w = jnp.where(jnp.isfinite(log_w), log_w, -jnp.inf)
         lse = jax.scipy.special.logsumexp(log_w)
         log_inc = lse - jnp.log(n)
         weights = jnp.exp(log_w - lse)
         k1, k2 = jax.random.split(key)
-        idx = systematic(k1, weights, n_ancestors)
-        ancestors = particles[idx]
-        last, history, accept = run_chains(k2, ancestors, lmbda_new, params, n_moves)
-        if waste_free:
+        if wf:
+            ancestors = particles[systematic(k1, weights, n // mcmc_steps)]
+            history, accept = mutate_fixed(k2, ancestors, lmbda_new, params, mcmc_steps - 1)
             new_particles = jnp.concatenate([ancestors[:, None, :], history], axis=1).reshape(n, dim)
+            dist = distance(history[:, -1], ancestors, scale_var)
+            n_moves = jnp.int32(mcmc_steps - 1)
         else:
-            new_particles = last
-        return new_particles, log_inc, jnp.mean(accept)
+            ancestors = particles[systematic(k1, weights, n)]
+            new_particles, accept, n_moves, dist = mutate_adaptive(k2, ancestors, lmbda_new, params,
+                                                                   scale_var)
+        return new_particles, log_inc, accept, n_moves, dist
 
     @jax.jit
     def pilot(key, starts, lmbda, params):
-        _, _, accept = run_chains(key, starts, lmbda, params, pilot_steps)
-        return jnp.mean(accept)
+        return mutate_fixed(key, starts, lmbda, params, pilot_steps)[1]
 
     def _to_jax_params(p):
         return {k: jnp.asarray(v) for k, v in p.items()}
@@ -409,13 +539,15 @@ def _run_one(jax, jnp, blackjax, compiled, *, particles0: np.ndarray, key, kerne
     increments: List[float] = []
     accepts: List[float] = []
     ess_hist: List[float] = []
+    moves_hist: List[int] = []
     t0 = time.perf_counter()
     n_iter = 0
     n_final = 0
     if progressbar:
-        wf = f"waste-free(p={mcmc_steps})" if waste_free else f"steps={mcmc_steps}"
+        wf = f"waste-free(p={mcmc_steps})" if waste_free else f"steps<={mcmc_steps}"
         print(f"[bjsi_smc] {tag} start | particles={n} dim={dim} kernel={kernel} {wf} "
-              f"target_ess={target_ess:.2f}", flush=True)
+              f"move_tol={move_tol} target_ess={target_ess:.2f} devices={n_devices}",
+              flush=True)
     while True:
         if lmbda >= 1.0:
             if n_final >= final_rounds:
@@ -449,11 +581,18 @@ def _run_one(jax, jnp, blackjax, compiled, *, particles0: np.ndarray, key, kerne
             tuning.adapt(acc)
         params = tuning.params()
         key, sub = jax.random.split(key)
-        particles, log_inc, accept = iteration(sub, particles, jnp.asarray(loglik), lmbda, lmbda_new,
-                                               _to_jax_params(params))
+        # Waste-free for the tempering increments; at the posterior every
+        # particle is moved, so the final rounds do not thin the population
+        # to draws / mcmc_steps ancestors.
+        particles, log_inc, accept, n_moves, dist = iteration(
+            sub, particles, jnp.asarray(loglik), lmbda, lmbda_new, _to_jax_params(params),
+            jnp.asarray(tuning._var), wf=bool(waste_free and lmbda < 1.0),
+        )
         particles.block_until_ready()
         loglik = np.asarray(batched_lik(particles))
         accept = float(accept)
+        n_moves = int(n_moves)
+        moves_hist.append(n_moves)
         log_inc = float(log_inc)
         log_evidence += log_inc
         increments.append(log_inc)
@@ -464,7 +603,8 @@ def _run_one(jax, jnp, blackjax, compiled, *, particles0: np.ndarray, key, kerne
         if progressbar:
             phase = "final" if lmbda >= 1.0 else f"iter {n_iter:3d}"
             print(f"[bjsi_smc] {tag} {phase} | lambda={lmbda_new:.5f} | ess={ess:7.1f}/{n} | "
-                  f"accept={accept:.2f} scale={tuning.scale:.3g} | logZ={log_evidence:9.2f} | "
+                  f"accept={accept:.2f} scale={tuning.scale:.3g} moves={n_moves} dist={float(dist):.2f} | "
+                  f"logZ={log_evidence:9.2f} | "
                   f"step={time.perf_counter() - step_t0:5.1f}s elapsed={time.perf_counter() - t0:6.1f}s",
                   flush=True)
         lmbda = lmbda_new
@@ -478,6 +618,7 @@ def _run_one(jax, jnp, blackjax, compiled, *, particles0: np.ndarray, key, kerne
         "log_evidence_increments": increments,
         "acceptance": accepts,
         "ess": ess_hist,
+        "moves": moves_hist,
         "total_time_s": float(time.perf_counter() - t0),
     }
     return np.asarray(particles), info
@@ -495,6 +636,7 @@ def sample_smc(
     progressbar: bool = True,
     kernel: str = "hmc",
     mcmc_steps: int = 5,
+    move_tol: Optional[float] = None,
     waste_free: bool = False,
     target_ess: float = 0.8,
     final_rounds: int = 2,
@@ -517,18 +659,27 @@ def sample_smc(
     draws : particles per run
     chains : independent SMC runs; they become the ``chain`` dimension so that
         the agreement of their evidences and summaries is the convergence check
-    cores : runs executed concurrently.  One run already vectorizes its
-        particles over the CPU, so the gain is the idle share of the machine
-        (about 2x on a hyper-threaded CPU); the runs share XLA's thread pool
-        from Python threads, JAX releasing the GIL during computation
+    cores : runs executed concurrently.  One run already spreads its
+        particles over every host device, so the gain is the idle share of the
+        machine; the runs share the devices from Python threads, JAX releasing
+        the GIL during computation
     kernel : ``"hmc"`` (default), ``"nuts"`` or ``"rmh"`` (random walk with the
         particle covariance).  On the Cushing fabric models the random walk
         leaves the population 20-40 nats below the posterior mode and gives
         run-to-run evidences that disagree by several nats; HMC with a
         diagonal mass from the cloud reaches the mode and the evidences of
         independent runs agree within a fraction of a nat.
-    mcmc_steps : moves per particle and tempering step (the waste-free ``p``)
+    mcmc_steps : most moves per particle and tempering step (the waste-free ``p``)
+    move_tol : the population stops moving once a move increases the mean
+        distance of the particles from their ancestors by less than this
+        fraction (at least 2 moves; the rule of Chopin's ``particles`` package).
+        ``None`` (default) always makes ``mcmc_steps`` moves.  On Cape (1720
+        events, K=1) 0.1 stopped at 4 of 5 moves and spread the log evidences
+        of independent runs over 1.5 nats, against 0.4 nat over six runs with
+        5 fixed moves: the HMC moves decorrelate slowly on these models.  Waste-free
+        increments always make ``mcmc_steps - 1`` moves.
     waste_free : keep every intermediate state (``draws / mcmc_steps`` ancestors)
+        during the tempering; the final rounds at the posterior move every particle
     target_ess : fraction of ``draws`` kept as ESS when choosing each increment
     final_rounds : extra mutation rounds at the posterior after the last increment
     target_accept : acceptance targeted by the scale adaptation
@@ -556,6 +707,8 @@ def sample_smc(
     rng = np.random.default_rng(random_seed)
     compiled = _compile_model(model, jax, jnp)
     dim = compiled["dim"]
+    mesh = _host_mesh(jax)
+    move_tol = None if move_tol is None else float(move_tol)
     key = jax.random.PRNGKey(int(rng.integers(2**31)))
 
     # Initial particles, keys and generators are drawn up front so that the
@@ -573,11 +726,12 @@ def sample_smc(
                                adaptation_rate=adaptation_rate, hmc_step_size=hmc_step_size)
         particles, info = _run_one(
             jax, jnp, blackjax, compiled, particles0=particles0, key=sub, kernel=kernel,
-            mcmc_steps=mcmc_steps, waste_free=waste_free, target_ess=target_ess,
-            final_rounds=final_rounds, max_iterations=max_iterations, tuning=tuning,
-            hmc_integration_steps=hmc_integration_steps, nuts_max_doublings=nuts_max_doublings,
-            pilot_rounds=int(pilot_rounds), pilot_size=min(int(pilot_size), draws),
-            pilot_steps=int(pilot_steps), progressbar=progressbar, tag=f"run {run + 1}/{chains}",
+            mcmc_steps=mcmc_steps, waste_free=waste_free, move_tol=move_tol,
+            target_ess=target_ess, final_rounds=final_rounds, max_iterations=max_iterations,
+            tuning=tuning, hmc_integration_steps=hmc_integration_steps,
+            nuts_max_doublings=nuts_max_doublings, pilot_rounds=int(pilot_rounds),
+            pilot_size=min(int(pilot_size), draws), pilot_steps=int(pilot_steps), mesh=mesh,
+            progressbar=progressbar, tag=f"run {run + 1}/{chains}",
         )
         if progressbar:
             status = "converged" if info["converged"] else "max_iterations"
@@ -603,6 +757,7 @@ def sample_smc(
         "chains": chains,
         "cores": cores,
         "mcmc_steps": mcmc_steps,
+        "move_tol": move_tol,
         "waste_free": bool(waste_free),
         "target_ess": float(target_ess),
         "final_rounds": int(final_rounds),

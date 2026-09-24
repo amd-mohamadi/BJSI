@@ -960,6 +960,34 @@ def _sanitize_arviz_name(name: str) -> str:
     return name
 
 
+def _arviz_summary(idata, var_names: list[str]) -> pd.DataFrame:
+    """``az.summary`` without r_hat when the posterior has a single chain.
+
+    r_hat needs at least two chains; a single-chain posterior (one SMC run, or
+    one basin of a multimodal run) would only give NaN and an ArviZ shape
+    warning, so the warning is suppressed and the column dropped.
+    """
+    import logging
+    import arviz as az
+
+    if idata.posterior.sizes.get("chain", 1) >= 2:
+        return az.summary(idata, var_names=var_names)
+
+    class _NoShapeWarning(logging.Filter):
+        def filter(self, record):
+            return "Shape validation failed" not in record.getMessage()
+
+    # ArviZ warns through its own Logger instance, not the one getLogger registers.
+    logger = getattr(az, "_log", None) or logging.getLogger("arviz")
+    shape_filter = _NoShapeWarning()
+    logger.addFilter(shape_filter)
+    try:
+        df = az.summary(idata, var_names=var_names)
+    finally:
+        logger.removeFilter(shape_filter)
+    return df.drop(columns="r_hat", errors="ignore")
+
+
 def arviz_uncertainty_metrics(idata, *, var_names: list[str]) -> dict[str, float]:
     """Return ArviZ uncertainty and convergence metrics for selected variables."""
     if idata is None or not hasattr(idata, "posterior"):
@@ -971,9 +999,7 @@ def arviz_uncertainty_metrics(idata, *, var_names: list[str]) -> dict[str, float
         return {}
 
     try:
-        import arviz as az
-
-        df = az.summary(idata, var_names=present)
+        df = _arviz_summary(idata, present)
     except Exception:
         return {}
 
@@ -1014,9 +1040,7 @@ def write_arviz_outputs(
         return
 
     try:
-        import arviz as az
-
-        df = az.summary(idata, var_names=present)
+        df = _arviz_summary(idata, present)
         with open(os.path.join(output_dir, "arviz.summary.txt"), "w", encoding="utf-8") as f:
             f.write(df.to_string())
             f.write("\n")

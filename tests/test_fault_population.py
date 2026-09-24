@@ -166,10 +166,9 @@ def test_exp_population_matches_legacy_plane_prior():
 def test_exp_population_adds_the_orientation_evidence():
     """The population objective exceeds the legacy one by the orientation evidence.
 
-    With g = exp(beta I) the legacy mixture equals the population mixture divided
-    by exp(beta I_1) + exp(beta I_2). That factor is the density of the observed
-    fault orientations under the population, and it depends on the stress, which
-    is precisely the term the legacy objective omits.
+    With g = exp(beta I), the ratio of the unnormalized population likelihood
+    to the legacy likelihood is (exp(beta I_1) + exp(beta I_2)) / 2. The factor
+    1/2 averages the plane labelings and does not depend on the stress.
     """
     n1, _, n2, _ = synthetic_catalog(40)
     legacy = build(None)
@@ -183,7 +182,7 @@ def test_exp_population_adds_the_orientation_evidence():
             evidence = np.sum(np.logaddexp(
                 10.0 * instability_from_sigma(n1, Sigma, float(mu)),
                 10.0 * instability_from_sigma(n2, Sigma, float(mu)),
-            ))
+            ) - np.log(2.0))
             assert abs((b - a) - evidence) < 1e-4, (b - a, evidence)   # legacy normalizes by |q| + 1e-8
 
 
@@ -264,6 +263,45 @@ def test_normalized_model_has_the_potential_and_is_finite():
     assert "population_normalizer" in names
     values = eval_vars(model, model.potentials, at_point(model))
     assert all(np.isfinite(float(v)) for v in values)
+
+
+def test_uniform_population_and_slip_have_unit_mass():
+    """Uniform normals and rake give density 1/(2*pi), not twice that density."""
+    n_events = 7
+    model = build(
+        {"family": "exp", "beta": 0.0,
+         "table": {"R_points": 3, "mu_points": 3, "power": 8}},
+        n_events=n_events, slip_vmf_kappa_val=0.0,
+    )
+    likelihood, normalizer, p2 = eval_vars(
+        model, ["likelihood", "population_normalizer", "p_plane2_post"],
+        at_point(model),
+    )
+    # The reference measure is uniform probability on normals times rake angle.
+    np.testing.assert_allclose(
+        likelihood + normalizer, -n_events * np.log(2.0 * np.pi), atol=1e-10,
+    )
+    np.testing.assert_allclose(p2, 0.5, atol=1e-12)
+
+
+def test_population_plane_probabilities_use_relative_contributions():
+    """The labeling average cancels from nonuniform conditional plane probabilities."""
+    n_events, beta, kappa = 7, 4.0, 8.0
+    model = build({"family": "exp", "beta": beta, "normalize": False},
+                  n_events=n_events, slip_vmf_kappa_val=kappa)
+    Sigma, mu, p2 = eval_vars(model, ["Sigma", "mu", "p_plane2_post"], at_point(model))
+    n1, s1, n2, s2 = synthetic_catalog(n_events)
+    scores = []
+    for normals, slips in ((n1, s1), (n2, s2)):
+        traction = normals @ Sigma
+        normal_traction = np.sum(traction * normals, axis=1)
+        shear = traction - normal_traction[:, None] * normals
+        predicted = shear / np.linalg.norm(shear, axis=1, keepdims=True)
+        cosine = np.sum(predicted * slips, axis=1)
+        log_slip = kappa * cosine - np.log(2.0 * np.pi) - kappa - np.log(i0e(kappa))
+        scores.append(beta * instability_from_sigma(normals, Sigma, float(mu)) + log_slip)
+    expected = expit(scores[1] - scores[0])
+    np.testing.assert_allclose(p2, expected, rtol=1e-7, atol=1e-9)
 
 
 def test_normalizer_removes_the_friction_trend():
@@ -456,6 +494,56 @@ def test_bingham_fabric_model_builds_and_is_finite():
     assert all(np.isfinite(float(v)) for v in values)
 
 
+def test_slip_fabric_swaps_the_planes_it_favours():
+    """A double couple's slip vector is the normal of its other plane, so with the
+    stress term switched off the slip fabric gives the complementary plane odds."""
+    spec = {"family": "ramp", "imin": "infer", "fabric_K": 1, "fabric_family": "bingham",
+            "table": {"R_points": 21, "mu_points": 17, "imin_points": 20, "power": 14}}
+    p2 = {}
+    for on in ("normal", "slip"):
+        model = build(dict(spec, fabric_on=on))
+        point = at_point(model, w_population_interval__=np.array(-30.0),
+                         fabric_kappa_log__=np.log(np.array([[20.0, 5.0]])))
+        p2[on], potential = eval_vars(model, ["p_plane2", likelihood_potential(model)], point)
+        assert np.isfinite(float(potential))
+    assert np.ptp(p2["normal"]) > 0.1
+    # w is clipped at 1e-9 in the graph, so the stress term is not exactly zero.
+    np.testing.assert_allclose(p2["slip"], 1.0 - p2["normal"], atol=1e-5)
+
+
+def test_slip_fabric_requires_the_additive_form():
+    fp.resolve_population_spec({"family": "ramp", "fabric_on": "slip"},
+                               selection_beta=10.0, friction_range=(0.2, 1.0))
+    with pytest.raises(ValueError):
+        fp.resolve_population_spec({"family": "ramp", "fabric_on": "slip", "fabric_mode": "product"},
+                                   selection_beta=10.0, friction_range=(0.2, 1.0))
+    with pytest.raises(ValueError):
+        fp.resolve_population_spec({"family": "ramp", "fabric_on": "rake"},
+                                   selection_beta=10.0, friction_range=(0.2, 1.0))
+
+
+def test_w_prior_is_a_beta_on_the_stress_fraction():
+    import pymc as pm
+    import scipy.stats
+    table = {"R_points": 21, "mu_points": 17, "imin_points": 20, "power": 14}
+    base = {"family": "ramp", "imin": "infer", "fabric_K": 1, "table": table}
+    uniform = build(base)
+    beta = build(dict(base, w_prior=[4.0, 2.0]))
+    assert type(uniform["w_population"].owner.op).__name__.startswith("Uniform")
+    assert type(beta["w_population"].owner.op).__name__.startswith("Beta")
+    w = np.array([0.1, 0.5, 0.9])
+    logp = pm.logp(beta["w_population"], w).eval()
+    np.testing.assert_allclose(logp, scipy.stats.beta(4.0, 2.0).logpdf(w), rtol=1e-6)
+    values = eval_vars(beta, beta.potentials, at_point(beta))
+    assert all(np.isfinite(float(v)) for v in values)
+    for bad in ([4.0], [4.0, 0.0], [4.0, -1.0]):
+        with pytest.raises(ValueError):
+            fp.resolve_population_spec(dict(base, w_prior=bad), selection_beta=10.0, friction_range=(0.2, 1.0))
+    with pytest.raises(ValueError):  # the product form has no w
+        fp.resolve_population_spec({"family": "ramp", "fabric_K": 1, "fabric_mode": "product", "w_prior": [4, 2]},
+                                   selection_beta=10.0, friction_range=(0.2, 1.0))
+
+
 def test_subset_results_recomputes_from_selected_chains():
     """Per-basin summaries must come from the selected chains only."""
     import arviz as az
@@ -515,3 +603,23 @@ def test_gnomonic_rotation_prior_is_haar():
         D = Ra.T @ Rb
         assert np.allclose(np.abs(np.diag(D)), 1.0) and np.allclose(D - np.diag(np.diag(D)), 0.0, atol=1e-9)
         assert np.linalg.norm(v0) <= np.sqrt(3) + 1e-9
+
+
+def test_default_imin_is_fixed_at_point_seven():
+    spec = fp.resolve_population_spec("default", selection_beta=1.0, friction_range=(0.2, 1.0))
+    assert spec["imin"] == 0.7
+    spec = fp.resolve_population_spec({"fabric_K": 2}, selection_beta=1.0, friction_range=(0.2, 1.0))
+    assert spec["imin"] == 0.7
+
+
+def test_w_fixed_holds_the_stress_fraction():
+    table = {"R_points": 21, "mu_points": 17, "power": 14}
+    model = build({"family": "ramp", "imin": 0.7, "fabric_K": 1, "w_fixed": 0.4, "table": table})
+    assert "w_population" not in [v.name for v in model.free_RVs]
+    np.testing.assert_allclose(model["w_population"].eval(), 0.4)
+    with pytest.raises(ValueError):
+        fp.resolve_population_spec({"fabric_K": 1, "w_fixed": 0.4, "w_prior": [4, 2]},
+                                   selection_beta=1.0, friction_range=(0.2, 1.0))
+    with pytest.raises(ValueError):
+        fp.resolve_population_spec({"fabric_K": 1, "w_fixed": 1.0},
+                                   selection_beta=1.0, friction_range=(0.2, 1.0))

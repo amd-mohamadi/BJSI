@@ -567,9 +567,20 @@ def _build_joint_model(
                 product_fabric = pop_spec["fabric_K"] > 0 and pop_spec["fabric_mode"] == "product"
                 if pop_spec["mix_uniform"] or pop_spec["fabric_K"] > 0:
                     if not product_fabric:
-                        mix_weight = pm.Uniform("w_population", lower=0.0, upper=1.0)
+                        if pop_spec["w_fixed"] is not None:
+                            mix_weight = pm.Deterministic(
+                                "w_population", pt.as_tensor_variable(pop_spec["w_fixed"])
+                            )
+                        elif pop_spec["w_prior"] is None:
+                            mix_weight = pm.Uniform("w_population", lower=0.0, upper=1.0)
+                        else:
+                            a_w, b_w = pop_spec["w_prior"]
+                            mix_weight = pm.Beta("w_population", alpha=a_w, beta=b_w)
                     if pop_spec["fabric_K"] > 0:
                         K = int(pop_spec["fabric_K"])
+                        # The fabric describes fault normals, or slip directions
+                        # with fabric_on='slip' (additive form only).
+                        v1, v2 = (s1, s2) if pop_spec["fabric_on"] == "slip" else (n1, n2)
                         rng_init = np.random.default_rng(0)
                         if K > 1:
                             fabric_pi = pm.Dirichlet(
@@ -593,8 +604,8 @@ def _build_joint_model(
                                 "fabric_kappa", sigma=float(pop_spec["fabric_kappa_sigma"]),
                                 shape=(K, 2),
                             )
-                            log_h1 = _fp.log_bingham_mixture_pt(n1, axes, fabric_kappa, log_pi)
-                            log_h2 = _fp.log_bingham_mixture_pt(n2, axes, fabric_kappa, log_pi)
+                            log_h1 = _fp.log_bingham_mixture_pt(v1, axes, fabric_kappa, log_pi)
+                            log_h2 = _fp.log_bingham_mixture_pt(v2, axes, fabric_kappa, log_pi)
                         else:
                             # A Watson axis is the third column of a uniformly
                             # random rotation (its marginal is uniform on the
@@ -609,8 +620,8 @@ def _build_joint_model(
                             fabric_kappa = pm.HalfNormal(
                                 "fabric_kappa", sigma=float(pop_spec["fabric_kappa_sigma"]), shape=K,
                             )
-                            log_h1 = _fp.log_watson_mixture_pt(n1, axes, fabric_kappa, log_pi)
-                            log_h2 = _fp.log_watson_mixture_pt(n2, axes, fabric_kappa, log_pi)
+                            log_h1 = _fp.log_watson_mixture_pt(v1, axes, fabric_kappa, log_pi)
+                            log_h2 = _fp.log_watson_mixture_pt(v2, axes, fabric_kappa, log_pi)
                     else:
                         log_h1 = pt.zeros_like(log_g1)
                         log_h2 = pt.zeros_like(log_g2)
@@ -651,7 +662,9 @@ def _build_joint_model(
                 logw1 = log_g1 + ll1
                 logw2 = log_g2 + ll2
                 logmix = pt.logaddexp(logw1, logw2)
-                pm.Potential("likelihood", pt.sum(logmix))
+                # Average the equivalent plane labelings for the event density.
+                # Keep logmix as the sum for conditional plane probabilities.
+                pm.Potential("likelihood", pt.sum(logmix - np.log(2.0)))
 
                 if pop_spec["normalize"] and product_fabric:
                     n_qmc = _fp.sobol_unit_normals(
@@ -889,8 +902,11 @@ def summarize_posterior(idata, hdi_prob: float = 0.9) -> Dict[str, Any]:
     return results
 
 
-def _population_results(idata, fault_population) -> Optional[Dict[str, Any]]:
+def _population_results(idata, fault_population, idata_runs=None) -> Optional[Dict[str, Any]]:
     """Summarize the fault-population parameters and the basin structure.
+
+    ``idata_runs``, when given, holds the separate runs behind a pooled
+    ``idata`` (see ``basins.pool_runs``); the basins are found among them.
 
     Returns ``None`` for the historical unnormalized mixture. Population models
     are multimodal on real catalogs, so the basin report is part of the result
@@ -934,7 +950,7 @@ def _population_results(idata, fault_population) -> Optional[Dict[str, Any]]:
         except ImportError:
             return out
     try:
-        out["basins"] = _basins.basin_report(idata)
+        out["basins"] = _basins.basin_report(idata if idata_runs is None else idata_runs)
     except Exception as exc:  # pragma: no cover - diagnostics must not break a run
         warnings.warn(f"Basin report failed: {exc}", RuntimeWarning)
     return out
@@ -2098,8 +2114,22 @@ def Bayesian_joint_plane_selection_NUTS(
             # Default PyMC NUTS
             idata = pm.sample(**sampler_kwargs)
 
+    # Independent SMC runs are pooled by their evidence; an equal-weight pool
+    # would give a run stuck in a mode of negligible mass the same say as the
+    # dominant one.  The runs are kept for the basin tools.
+    idata_runs = None
+    if smc_info is not None and chains > 1:
+        try:
+            from . import basins as _basins
+        except ImportError:
+            import basins as _basins
+        idata_runs = idata
+        idata = _basins.pool_runs(idata_runs, smc_info["log_evidence"])
+        smc_info["run_weights"] = idata.attrs["run_weights"]
+
     # --- Post-processing (mirror SMC outputs) ---
     results: Dict[str, Any] = summarize_posterior(idata, hdi_prob=hdi_prob)
+    results["idata_runs"] = idata_runs
     R_median = results["R_median"]
     pd_median = results["principal_directions"]
     mu_samples = results["mu_samples"]
@@ -2107,7 +2137,7 @@ def Bayesian_joint_plane_selection_NUTS(
 
     results["mechanism_sigma_deg"] = mechanism_errors.copy()
     results["fixed_plane_indices"] = None if fixed_plane_indices is None else fixed_plane_indices.copy()
-    results["fault_population"] = _population_results(idata, fault_population)
+    results["fault_population"] = _population_results(idata, fault_population, idata_runs)
 
     if return_plane_probabilities:
         if iterative_plane_selection:
@@ -2179,6 +2209,9 @@ def Bayesian_joint_plane_selection_NUTS(
             "kernel": smc_info["kernel"], "log_evidence": smc_info["log_evidence"],
             "n_iterations": smc_info["n_iterations"],
         })
+        if idata_runs is not None:
+            results["convergence"].update({"pooling": "evidence", "run_weights": smc_info["run_weights"],
+                                           "n_samples": idata.posterior.sizes["draw"]})
         results["smc"] = smc_info
         if results.get("fault_population") is not None:
             results["fault_population"]["log_evidence"] = smc_info["log_evidence"]
