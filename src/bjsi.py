@@ -360,7 +360,7 @@ def _build_joint_model(
                 "A fault population requires the joint two-plane mixture; it cannot be "
                 "combined with iterative preselection or externally fixed plane labels"
             )
-        if pop_spec["normalize"] and pop_spec.get("fabric_mode") != "product":
+        if pop_spec["normalize"] and pop_spec.get("fabric_mode") not in {"product", "gated"}:
             pop_spec["_table"] = _fp.normalizer_table(pop_spec)
 
     with pm.Model() as model:
@@ -565,8 +565,10 @@ def _build_joint_model(
 
                 mix_weight = None
                 product_fabric = pop_spec["fabric_K"] > 0 and pop_spec["fabric_mode"] == "product"
+                # gated with fabric_K=0 is the instability-only gate (no fabric term).
+                gated_fabric = pop_spec["fabric_mode"] == "gated"
                 if pop_spec["mix_uniform"] or pop_spec["fabric_K"] > 0:
-                    if not product_fabric:
+                    if not (product_fabric or gated_fabric):
                         if pop_spec["w_fixed"] is not None:
                             mix_weight = pm.Deterministic(
                                 "w_population", pt.as_tensor_variable(pop_spec["w_fixed"])
@@ -625,7 +627,9 @@ def _build_joint_model(
                     else:
                         log_h1 = pt.zeros_like(log_g1)
                         log_h2 = pt.zeros_like(log_g2)
-                    if product_fabric:
+                    if gated_fabric:
+                        pass  # combined per event below, not as a population density
+                    elif product_fabric:
                         # Faults exist per the fabric and reactivate per the
                         # stress: g(I(n)) h(n), normalized below by quasi-Monte
                         # Carlo because Z couples the fabric axes to the frame.
@@ -655,41 +659,67 @@ def _build_joint_model(
                     pm.Deterministic("fabric_overlap", o_main)
                     pm.Potential("fabric_overlap_penalty", penalty)
 
-                # Prior plane probability implied by the population.
-                log_gsum = pt.logaddexp(log_g1, log_g2)
-                p2 = pm.Deterministic("p_plane2", pt.clip(pt.exp(log_g2 - log_gsum), eps, 1.0 - eps))
-
-                logw1 = log_g1 + ll1
-                logw2 = log_g2 + ll2
-                logmix = pt.logaddexp(logw1, logw2)
-                # Average the equivalent plane labelings for the event density.
-                # Keep logmix as the sum for conditional plane probabilities.
-                pm.Potential("likelihood", pt.sum(logmix - np.log(2.0)))
-
-                if pop_spec["normalize"] and product_fabric:
-                    n_qmc = _fp.sobol_unit_normals(
-                        pop_spec["product_qmc_power"], pop_spec["table"]["seed"]
-                    )
-                    n_qmc_t = pt.as_tensor_variable(n_qmc)
-                    inst_q = instability_parameter_log(Sigma, n_qmc_t, mu, Rratio)
-                    log_gq = _fp.log_population_weight_pt(inst_q, pop_spec, imin_var)
-                    if pop_spec["fabric_family"] == "bingham":
-                        log_hq = _fp.log_bingham_mixture_pt(n_qmc_t, axes, fabric_kappa, log_pi)
+                if gated_fabric and pop_spec["fabric_K"] == 0:
+                    log_h1 = pt.zeros_like(log_g1)
+                    log_h2 = pt.zeros_like(log_g2)
+                if gated_fabric:
+                    # Per-event log-odds: instability everywhere, the fabric only
+                    # where the instability contrast is small. No normalizer and
+                    # no weight w; see "Gated selection" in fault_population.py.
+                    d_inst = inst2 - inst1
+                    gate = pt.exp(-pt.square(d_inst / float(pop_spec["gate_width"])))
+                    pm.Deterministic("gate_open", gate)
+                    logit2 = (float(pop_spec["gate_alpha"]) * d_inst
+                              + float(pop_spec["gate_beta"]) * gate * (log_h2 - log_h1))
+                    p2 = pm.Deterministic("p_plane2", pt.clip(pm.math.sigmoid(logit2), eps, 1.0 - eps))
+                    logw1 = -pt.softplus(logit2) + ll1
+                    logw2 = -pt.softplus(-logit2) + ll2
+                    logmix = pt.logaddexp(logw1, logw2)
+                    pm.Potential("likelihood", pt.sum(logmix))
+                    if pop_spec["gate_fabric_fit"] == "selected":
+                        log_fab = pt.logaddexp(logw1 - logmix + log_h1, logw2 - logmix + log_h2)
                     else:
-                        log_hq = _fp.log_watson_mixture_pt(n_qmc_t, axes, fabric_kappa, log_pi)
-                    log_Z = pt.logsumexp(log_gq + log_hq) - np.log(float(n_qmc.shape[0]))
-                    pm.Deterministic("log_Z_population", log_Z)
-                    pm.Potential("population_normalizer", -float(n_events_total) * log_Z)
-                elif pop_spec["normalize"]:
-                    log_Z = _fp.interp_normalizer_pt(
-                        pop_spec["_table"], Rratio, mu, imin_var
-                    )
-                    if mix_weight is not None:
-                        log_Z = pt.log(mix_weight * pt.exp(log_Z) + (1.0 - mix_weight))
-                    pm.Deterministic("log_Z_population", log_Z)
-                    pm.Potential("population_normalizer", -float(n_events_total) * log_Z)
+                        log_fab = pt.logaddexp(log_h1, log_h2) - np.log(2.0)
+                    if pop_spec["fabric_K"] > 0:
+                        pm.Potential("fabric_likelihood", float(pop_spec["gate_fabric_weight"]) * pt.sum(log_fab))
+                    p_plane2_post = pm.Deterministic("p_plane2_post", pt.exp(logw2 - logmix))
 
-                p_plane2_post = pm.Deterministic("p_plane2_post", pt.exp(logw2 - logmix))
+                else:
+                    # Prior plane probability implied by the population.
+                    log_gsum = pt.logaddexp(log_g1, log_g2)
+                    p2 = pm.Deterministic("p_plane2", pt.clip(pt.exp(log_g2 - log_gsum), eps, 1.0 - eps))
+
+                    logw1 = log_g1 + ll1
+                    logw2 = log_g2 + ll2
+                    logmix = pt.logaddexp(logw1, logw2)
+                    # Average the equivalent plane labelings for the event density.
+                    # Keep logmix as the sum for conditional plane probabilities.
+                    pm.Potential("likelihood", pt.sum(logmix - np.log(2.0)))
+
+                    if pop_spec["normalize"] and product_fabric:
+                        n_qmc = _fp.sobol_unit_normals(
+                            pop_spec["product_qmc_power"], pop_spec["table"]["seed"]
+                        )
+                        n_qmc_t = pt.as_tensor_variable(n_qmc)
+                        inst_q = instability_parameter_log(Sigma, n_qmc_t, mu, Rratio)
+                        log_gq = _fp.log_population_weight_pt(inst_q, pop_spec, imin_var)
+                        if pop_spec["fabric_family"] == "bingham":
+                            log_hq = _fp.log_bingham_mixture_pt(n_qmc_t, axes, fabric_kappa, log_pi)
+                        else:
+                            log_hq = _fp.log_watson_mixture_pt(n_qmc_t, axes, fabric_kappa, log_pi)
+                        log_Z = pt.logsumexp(log_gq + log_hq) - np.log(float(n_qmc.shape[0]))
+                        pm.Deterministic("log_Z_population", log_Z)
+                        pm.Potential("population_normalizer", -float(n_events_total) * log_Z)
+                    elif pop_spec["normalize"]:
+                        log_Z = _fp.interp_normalizer_pt(
+                            pop_spec["_table"], Rratio, mu, imin_var
+                        )
+                        if mix_weight is not None:
+                            log_Z = pt.log(mix_weight * pt.exp(log_Z) + (1.0 - mix_weight))
+                        pm.Deterministic("log_Z_population", log_Z)
+                        pm.Potential("population_normalizer", -float(n_events_total) * log_Z)
+
+                    p_plane2_post = pm.Deterministic("p_plane2_post", pt.exp(logw2 - logmix))
             else:
                 inst_delta = inst2 - inst1
                 beta_val = float(instability_beta if selection_beta is None else selection_beta)

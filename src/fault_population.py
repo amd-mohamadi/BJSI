@@ -92,6 +92,24 @@ main family, not an unrelated set.  The constraint is a soft penalty
 with the data by the SMC sampler; the log evidence it reports therefore
 includes the prior mass of the admissible region, whose logarithm
 :func:`overlap_prior_log_norm` estimates so that it can be removed.
+
+Gated selection
+---------------
+``fabric_mode='gated'`` removes the competition for density.  The plane choice
+of each event is a log-odds sum in which the fabric acts only where the
+instability contrast is small,
+
+    logit p_2 = a dI + b s(dI) [log h(n_2) - log h(n_1)],
+    s(dI)     = exp(-(dI / width)^2),       dI = I_2 - I_1,
+
+(``gate_alpha``, ``gate_beta``, ``gate_width``), and the event term is the
+weighted average ``(1 - p_2) L_1 + p_2 L_2``.  Only differences between the two
+planes of an event enter, so there is no population normalizer and no weight
+``w`` that can switch either term off.  The fabric is learned from its own
+term, ``gate_fabric_weight * sum_i log sum_k r_ik B(n_ik)``, with ``r`` the
+posterior plane probabilities (``gate_fabric_fit='selected'``) or one half
+(``'nodal'``: the fabric of all nodal planes, independent of the stress).
+With ``fabric_K=0`` the fabric term is absent and ``logit p_2 = a dI``.
 """
 from __future__ import annotations
 
@@ -249,6 +267,18 @@ def resolve_population_spec(
         "fabric_overlap_strength": float(spec.get("fabric_overlap_strength", _D["fabric_overlap_strength"])),
         "table": dict(spec.get("table", {})),
     }
+    if out["fabric_mode"] == "gated":
+        out["gate_alpha"] = float(spec.get("gate_alpha", 10.0))
+        out["gate_beta"] = float(spec.get("gate_beta", 1.0))
+        out["gate_width"] = float(spec.get("gate_width", 0.1))
+        out["gate_fabric_fit"] = str(spec.get("gate_fabric_fit", "selected")).strip().lower()
+        out["gate_fabric_weight"] = float(spec.get("gate_fabric_weight", 1.0))
+        if out["gate_fabric_fit"] not in {"selected", "nodal"}:
+            raise ValueError("gate_fabric_fit must be 'selected' or 'nodal'")
+        if min(out["gate_alpha"], out["gate_beta"], out["gate_fabric_weight"]) < 0.0 or out["gate_width"] <= 0.0:
+            raise ValueError("gate_alpha, gate_beta, gate_fabric_weight must be >= 0 and gate_width > 0")
+        if out["fabric_on"] != "normal":
+            raise ValueError("fabric_mode='gated' is only defined on normals")
     w_prior = spec.get("w_prior")
     if w_prior is not None:
         w_prior = [float(v) for v in w_prior]
@@ -267,8 +297,8 @@ def resolve_population_spec(
         if not (out["mix_uniform"] or (out["fabric_K"] > 0 and out["fabric_mode"] == "additive")):
             raise ValueError("w_fixed needs the weight w: an additive fabric or mix_uniform")
     out["w_fixed"] = w_fixed
-    if out["fabric_mode"] not in {"additive", "product"}:
-        raise ValueError("fabric_mode must be 'additive' or 'product'")
+    if out["fabric_mode"] not in {"additive", "product", "gated"}:
+        raise ValueError("fabric_mode must be 'additive', 'product' or 'gated'")
     if out["fabric_on"] not in {"normal", "slip"}:
         raise ValueError("fabric_on must be 'normal' or 'slip'")
     if out["fabric_on"] == "slip" and out["fabric_mode"] == "product":
