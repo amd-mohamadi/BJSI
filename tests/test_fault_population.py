@@ -623,3 +623,81 @@ def test_w_fixed_holds_the_stress_fraction():
     with pytest.raises(ValueError):
         fp.resolve_population_spec({"fabric_K": 1, "w_fixed": 1.0},
                                    selection_beta=1.0, friction_range=(0.2, 1.0))
+
+
+def test_gated_spec_anchored_and_bounded():
+    spec = fp.resolve_population_spec(
+        {
+            "fabric_mode": "gated",
+            "fabric_K": 1,
+            "gate_fabric_fit": "anchored",
+            "gate_anchor_alpha": 12.0,
+            "gate_max_log_odds": 4.0,
+            "gate_anchor_disconnect": True,
+        },
+        selection_beta=10.0,
+        friction_range=(0.2, 1.0),
+    )
+    assert spec["gate_fabric_fit"] == "anchored"
+    assert spec["gate_anchor_alpha"] == 12.0
+    assert spec["gate_max_log_odds"] == 4.0
+    assert spec["gate_anchor_disconnect"] is True
+    assert spec["gate_fabric_weight"] == 0.25
+
+
+def test_compute_k0_anchor_d_inst_and_model_build():
+    from bjsi import _build_joint_model
+
+    # Simple synthetic catalog of strike-slip events
+    rng = np.random.default_rng(42)
+    N = 10
+    n1 = np.tile([1.0, 0.0, 0.0], (N, 1))
+    s1 = np.tile([0.0, 1.0, 0.0], (N, 1))
+    n2 = np.tile([0.0, 1.0, 0.0], (N, 1))
+    s2 = np.tile([1.0, 0.0, 0.0], (N, 1))
+
+    d_inst_anc = fp.compute_k0_anchor_d_inst(
+        n1, s1, n2, s2,
+        alpha_gate=10.0,
+        vmf_kappa=8.0,
+        friction_range=(0.2, 1.0),
+    )
+    assert d_inst_anc.shape == (N,)
+    assert np.all(np.isfinite(d_inst_anc))
+
+    pop_spec = {
+        "family": "ramp",
+        "fabric_mode": "gated",
+        "fabric_K": 1,
+        "fabric_family": "watson",
+        "gate_fabric_fit": "anchored",
+        "gate_max_log_odds": 4.0,
+        "gate_anchor_d_inst": d_inst_anc.tolist(),
+    }
+    model, _ = _build_joint_model(
+        n1=n1, n2=n2, s1=s1, s2=s2,
+        q_prior_mu_arr=None, q_prior_sigma=1.0,
+        R_prior_mu_val=None, R_prior_sigma=0.1,
+        infer_friction=False, infer_friction_method="fixed",
+        friction_fixed=0.6, friction_prior_params=(3.0, 3.0),
+        friction_range=(0.2, 1.0),
+        iterative_plane_selection=False, iterative_info={},
+        event_weights=None, weighted_likelihood=False,
+        likelihood_weight_mode="event", tau_weight_exponent=0.0,
+        normalize_tau_weights=True, tau_weight_clip=None,
+        slip_likelihood_name="von_mises_fisher", slip_misfit_sigma=0.1,
+        slip_vmf_kappa_val=8.0, instability_beta=10.0,
+        selection_beta=10.0, signed_instability=False,
+        clustering_prior_strength=0.0,
+        plane2_prior_probs_arr=None, plane_prior_strength=0.0,
+        enforce_constant_shear=False, shear_weight=0.0,
+        shear_sigma=0.1, shear_center="mean",
+        shear_target=None, shear_target_sigma=0.1,
+        fault_population=pop_spec,
+    )
+    assert "gate_open" in [v.name for v in model.deterministics]
+    assert "p_plane2" in [v.name for v in model.deterministics]
+    init_pt = model.initial_point()
+    logp_val = model.compile_fn(model.logp())(init_pt)
+    assert np.isfinite(logp_val)
+

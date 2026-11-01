@@ -363,6 +363,28 @@ def _build_joint_model(
         if pop_spec["normalize"] and pop_spec.get("fabric_mode") not in {"product", "gated"}:
             pop_spec["_table"] = _fp.normalizer_table(pop_spec)
 
+    # Precompute detached K=0 instability contrast if needed
+    d_inst_0_arr = None
+    if (
+        pop_spec.get("fabric_mode") == "gated"
+        and pop_spec.get("fabric_K", 0) > 0
+        and pop_spec.get("gate_fabric_fit") == "anchored"
+        and pop_spec.get("gate_anchor_disconnect", True)
+    ):
+        if pop_spec.get("gate_anchor_d_inst") is not None:
+            d_inst_0_arr = np.asarray(pop_spec["gate_anchor_d_inst"], dtype=np.float64)
+        else:
+            d_inst_0_arr = _fp.compute_k0_anchor_d_inst(
+                n1, s1, n2, s2,
+                alpha_gate=float(pop_spec["gate_alpha"]),
+                vmf_kappa=float(slip_vmf_kappa_val or 8.0),
+                friction_range=friction_range,
+                friction_prior_params=friction_prior_params,
+                weighted_likelihood=weighted_likelihood,
+                tau_weight_exponent=tau_weight_exponent,
+                normalize_tau_weights=normalize_tau_weights,
+            )
+
     with pm.Model() as model:
         if mechanism_angles is not None:
             n1, s1, n2, s2 = latent_mechanism_vectors(
@@ -669,8 +691,15 @@ def _build_joint_model(
                     d_inst = inst2 - inst1
                     gate = pt.exp(-pt.square(d_inst / float(pop_spec["gate_width"])))
                     pm.Deterministic("gate_open", gate)
+                    raw_dlog_h = log_h2 - log_h1
+                    max_lo = pop_spec.get("gate_max_log_odds", None)
+                    if max_lo is not None and float(max_lo) > 0.0 and pop_spec["fabric_K"] > 0:
+                        M = float(max_lo)
+                        dlog_h_eff = M * pt.tanh(raw_dlog_h / M)
+                    else:
+                        dlog_h_eff = raw_dlog_h
                     logit2 = (float(pop_spec["gate_alpha"]) * d_inst
-                              + float(pop_spec["gate_beta"]) * gate * (log_h2 - log_h1))
+                              + float(pop_spec["gate_beta"]) * gate * dlog_h_eff)
                     p2 = pm.Deterministic("p_plane2", pt.clip(pm.math.sigmoid(logit2), eps, 1.0 - eps))
                     logw1 = -pt.softplus(logit2) + ll1
                     logw2 = -pt.softplus(-logit2) + ll2
@@ -678,6 +707,17 @@ def _build_joint_model(
                     pm.Potential("likelihood", pt.sum(logmix))
                     if pop_spec["gate_fabric_fit"] == "selected":
                         log_fab = pt.logaddexp(logw1 - logmix + log_h1, logw2 - logmix + log_h2)
+                    elif pop_spec["gate_fabric_fit"] == "anchored":
+                        alpha_anc = float(pop_spec.get("gate_anchor_alpha", pop_spec["gate_alpha"]))
+                        if d_inst_0_arr is not None:
+                            d_inst_anc = pt.as_tensor_variable(d_inst_0_arr)
+                        else:
+                            d_inst_anc = d_inst
+                        anc_logit2 = alpha_anc * d_inst_anc
+                        log_fab = pt.logaddexp(
+                            -pt.softplus(anc_logit2) + log_h1,
+                            -pt.softplus(-anc_logit2) + log_h2,
+                        )
                     else:
                         log_fab = pt.logaddexp(log_h1, log_h2) - np.log(2.0)
                     if pop_spec["fabric_K"] > 0:

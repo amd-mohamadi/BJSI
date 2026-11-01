@@ -124,6 +124,9 @@ from typing import Any, Dict, Optional, Tuple
 import numpy as np
 import pymc as pm
 import pytensor.tensor as pt
+from scipy.optimize import minimize
+from scipy.spatial.transform import Rotation
+from scipy.special import expit, i0e, logsumexp
 
 __all__ = [
     "DEFAULT_FAULT_POPULATION",
@@ -141,6 +144,7 @@ __all__ = [
     "normalizer_table",
     "interp_normalizer_pt",
     "cache_dir",
+    "compute_k0_anchor_d_inst",
 ]
 
 LEGACY = "legacy"
@@ -272,9 +276,17 @@ def resolve_population_spec(
         out["gate_beta"] = float(spec.get("gate_beta", 1.0))
         out["gate_width"] = float(spec.get("gate_width", 0.1))
         out["gate_fabric_fit"] = str(spec.get("gate_fabric_fit", "selected")).strip().lower()
-        out["gate_fabric_weight"] = float(spec.get("gate_fabric_weight", 1.0))
-        if out["gate_fabric_fit"] not in {"selected", "nodal"}:
-            raise ValueError("gate_fabric_fit must be 'selected' or 'nodal'")
+        out["gate_fabric_weight"] = float(spec.get("gate_fabric_weight", 0.25))
+        if out["gate_fabric_fit"] not in {"selected", "nodal", "anchored"}:
+            raise ValueError("gate_fabric_fit must be 'selected', 'nodal', or 'anchored'")
+        out["gate_anchor_alpha"] = float(spec.get("gate_anchor_alpha", out["gate_alpha"]))
+        out["gate_anchor_disconnect"] = bool(spec.get("gate_anchor_disconnect", True))
+        max_lo = spec.get("gate_max_log_odds", None)
+        out["gate_max_log_odds"] = float(max_lo) if max_lo is not None else None
+        if "gate_anchor_d_inst" in spec and spec["gate_anchor_d_inst"] is not None:
+            out["gate_anchor_d_inst"] = [float(v) for v in spec["gate_anchor_d_inst"]]
+        else:
+            out["gate_anchor_d_inst"] = None
         if min(out["gate_alpha"], out["gate_beta"], out["gate_fabric_weight"]) < 0.0 or out["gate_width"] <= 0.0:
             raise ValueError("gate_alpha, gate_beta, gate_fabric_weight must be >= 0 and gate_width > 0")
         if out["fabric_on"] != "normal":
@@ -783,3 +795,153 @@ def interp_normalizer_pt(table: Dict[str, np.ndarray], R, mu, imin=None):
             + (1 - fy) * fx * fz * corner(0, 1, 1)
             + fy * (1 - fx) * fz * corner(1, 0, 1)
             + fy * fx * fz * corner(1, 1, 1))
+
+
+# ----------------------------------------------------------------------------
+# Self-Tuned Instability-Anchored Fabric Fit (Detached K=0 Anchor)
+# ----------------------------------------------------------------------------
+
+_W_T_48, _W_WEIGHTS_48 = np.polynomial.legendre.leggauss(48)
+_W_WT_48 = 0.5 * _W_WEIGHTS_48
+
+
+def _watson_concentration(x: np.ndarray) -> float:
+    """Axial Watson MLE concentration kappa from the principal eigenvector of x.T @ x / N."""
+    x = np.asarray(x, dtype=np.float64)
+    _, v = np.linalg.eigh((x.T @ x) / max(len(x), 1))
+    a = v[:, -1]
+    c2_mean = float(np.mean((x @ a) ** 2))
+    res = minimize(
+        lambda k: -(k[0] * c2_mean - logsumexp(np.log(_W_WT_48) + k[0] * (_W_T_48 ** 2))),
+        [5.0],
+        bounds=[(0.0, 2000.0)],
+    )
+    return float(res.x[0])
+
+
+def compute_k0_anchor_d_inst(
+    n1: np.ndarray,
+    s1: np.ndarray,
+    n2: np.ndarray,
+    s2: np.ndarray,
+    *,
+    alpha_gate: float = 10.0,
+    vmf_kappa: float = 8.0,
+    friction_range: Tuple[float, float] = (0.2, 1.0),
+    friction_prior_params: Tuple[float, float] = (3.0, 3.0),
+    weighted_likelihood: bool = True,
+    tau_weight_exponent: float = 0.0,
+    normalize_tau_weights: bool = True,
+) -> np.ndarray:
+    """Compute detached K=0 instability contrast d_inst = I2 - I1 at the K=0 MAP stress/friction.
+
+    Also self-tunes the anchor scale based on the axial Watson concentration ratio
+    between K=0-rejected and K=0-selected fault poles:
+      r = kappa_rej / kappa_sel
+
+    - When r > 1.0 (e.g. Cases A & B under high R), auxiliary poles cluster more tightly
+      than true fault poles; full anchoring (scale = 1.0, alpha_eff = alpha_gate) is
+      applied to prevent the fabric from jumping onto the auxiliary cluster.
+    - When r <= 1.0 (e.g. Case C & Cushing), the true fault cluster is intrinsically
+      tighter, but K=0 may suffer from an unconstrained stress ridge; the anchor scale
+      smoothly damps to 0.015 (alpha_eff = 0.15) to act as a gentle tie-breaker that
+      allows the family to resolve the ridge without being misled.
+    """
+    n1 = np.asarray(n1, dtype=np.float64)
+    s1 = np.asarray(s1, dtype=np.float64)
+    n2 = np.asarray(n2, dtype=np.float64)
+    s2 = np.asarray(s2, dtype=np.float64)
+    mu_lo, mu_hi = float(friction_range[0]), float(friction_range[1])
+    a_mu, b_mu = float(friction_prior_params[0]), float(friction_prior_params[1])
+    p_tau = float(tau_weight_exponent) if weighted_likelihood else 0.0
+
+    def eval_k0(rv, R, mu):
+        V = Rotation.from_rotvec(rv).as_matrix()
+        S = V @ np.diag([-1.0, 2.0 * R - 1.0, 1.0]) @ V.T
+        denom = np.sqrt(1.0 + mu ** 2) + mu
+
+        t1 = n1 @ S
+        sn1 = np.sum(t1 * n1, axis=-1)
+        ts1 = t1 - sn1[:, None] * n1
+        tau1 = np.sqrt(np.sum(ts1 ** 2, axis=-1) + 1e-12)
+        sp1 = ts1 / tau1[:, None]
+        i1 = (tau1 + mu * (1.0 + sn1)) / denom
+
+        t2 = n2 @ S
+        sn2 = np.sum(t2 * n2, axis=-1)
+        ts2 = t2 - sn2[:, None] * n2
+        tau2 = np.sqrt(np.sum(ts2 ** 2, axis=-1) + 1e-12)
+        sp2 = ts2 / tau2[:, None]
+        i2 = (tau2 + mu * (1.0 + sn2)) / denom
+
+        if p_tau > 0.0:
+            t_evt = 0.5 * (tau1 + tau2)
+            t_scale = np.mean(t_evt) + 1e-12 if normalize_tau_weights else 1.0
+            w = (t_evt / t_scale) ** p_tau
+        else:
+            w = 1.0
+        keff = w * vmf_kappa
+        log_norm = np.log(2.0 * np.pi) + keff + np.log(i0e(keff))
+        ll1 = keff * np.clip(np.sum(s1 * sp1, axis=-1), -1.0, 1.0) - log_norm
+        ll2 = keff * np.clip(np.sum(s2 * sp2, axis=-1), -1.0, 1.0) - log_norm
+
+        d_inst = i2 - i1
+        logit2 = alpha_gate * d_inst
+        logw1 = -np.logaddexp(0.0, logit2) + ll1
+        logw2 = -np.logaddexp(0.0, -logit2) + ll2
+        ll = np.sum(np.logaddexp(logw1, logw2))
+
+        R_c = np.clip(R, 1e-4, 1.0 - 1e-4)
+        mu_raw = np.clip((mu - mu_lo) / (mu_hi - mu_lo), 1e-4, 1.0 - 1e-4)
+        lp = (
+            ll
+            + 2.0 * np.log(R_c * (1.0 - R_c))
+            + a_mu * np.log(mu_raw)
+            + b_mu * np.log(1.0 - mu_raw)
+        )
+        return d_inst, -float(lp)
+
+    # Principal P and T axes initial guess
+    P_axes = (n1 - s1) / np.linalg.norm(n1 - s1, axis=-1, keepdims=True)
+    T_axes = (n1 + s1) / np.linalg.norm(n1 + s1, axis=-1, keepdims=True)
+    _, vp = np.linalg.eigh(P_axes.T @ P_axes / len(P_axes))
+    _, vt = np.linalg.eigh(T_axes.T @ T_axes / len(T_axes))
+    v1 = vp[:, -1] / np.linalg.norm(vp[:, -1])
+    v3 = vt[:, -1] - np.dot(vt[:, -1], v1) * v1
+    v3 /= np.linalg.norm(v3)
+    v2 = np.cross(v3, v1)
+    V0 = np.column_stack([v1, v2, v3])
+    if np.linalg.det(V0) < 0:
+        V0[:, 1] *= -1
+
+    rng = np.random.default_rng(0)
+    starts = [Rotation.from_matrix(V0).as_rotvec()]
+    for deg in (-30, -15, 15, 30):
+        starts.append((Rotation.from_euler("z", deg, degrees=True) * Rotation.from_matrix(V0)).as_rotvec())
+    for _ in range(4):
+        starts.append(Rotation.random(random_state=rng).as_rotvec())
+
+    best = None
+    for rv0 in starts:
+        for R0, mu0 in ((0.55, 0.65), (0.80, 0.70)):
+            mu_u0 = np.clip((mu0 - mu_lo) / (mu_hi - mu_lo), 0.05, 0.95)
+            x0 = np.r_[rv0, np.log(R0 / (1.0 - R0)), np.log(mu_u0 / (1.0 - mu_u0))]
+            res = minimize(
+                lambda x: eval_k0(x[:3], float(expit(x[3])), mu_lo + (mu_hi - mu_lo) * float(expit(x[4])))[1],
+                x0,
+                method="BFGS",
+                options=dict(gtol=1e-4, maxiter=200),
+            )
+            if best is None or res.fun < best.fun:
+                best = res
+    x = best.x
+    d_inst_0, _ = eval_k0(x[:3], float(expit(x[3])), mu_lo + (mu_hi - mu_lo) * float(expit(x[4])))
+
+    sel_is_2 = d_inst_0 > 0
+    n_sel = np.where(sel_is_2[:, None], n2, n1)
+    n_rej = np.where(sel_is_2[:, None], n1, n2)
+    k_sel = _watson_concentration(n_sel)
+    k_rej = _watson_concentration(n_rej)
+    ratio = k_rej / max(k_sel, 1e-6)
+    scale = float(np.clip(0.015 + (ratio - 1.0) / 0.25, 0.015, 1.0))
+    return d_inst_0 * scale
